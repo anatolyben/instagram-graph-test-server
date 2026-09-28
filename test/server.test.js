@@ -1178,3 +1178,174 @@ describe("rate limits", () => {
     });
   });
 });
+
+describe("carousels", () => {
+  async function publisher() {
+    const context = await setup();
+    const shop = await context.server.createAccount({ username: "shop" });
+    const token = (await context.login(shop.id)).long.access_token;
+    const create = (form) =>
+      context.graph("POST", `${shop.id}/media`, { token, form });
+    const item = async (form) =>
+      (await create({ is_carousel_item: "true", ...form })).body.id;
+    return { ...context, shop, token, create, item };
+  }
+
+  it("publishes 2 to 10 items as one album, counted once, with its items as children", async () => {
+    const { graph, shop, token, create, item } = await publisher();
+    const photo = await item({ image_url: "https://example.com/a.jpg" });
+    const video = await item({
+      media_type: "VIDEO",
+      video_url: "https://example.com/b.mp4",
+    });
+    const album = await create({
+      media_type: "CAROUSEL",
+      children: `${photo},${video}`,
+      caption: "Two views",
+    });
+    await expect
+      .poll(
+        async () =>
+          (
+            await graph("GET", album.body.id, {
+              token,
+              query: { fields: "status_code" },
+            })
+          ).body.status_code,
+      )
+      .toBe("FINISHED");
+
+    const alone = await graph("POST", `${shop.id}/media_publish`, {
+      token,
+      form: { creation_id: photo },
+    });
+    expect(alone.status).toBe(400);
+    const published = await graph("POST", `${shop.id}/media_publish`, {
+      token,
+      form: { creation_id: album.body.id },
+    });
+
+    const post = await graph("GET", published.body.id, {
+      token,
+      query: { fields: "media_type,caption,children{media_type}" },
+    });
+    expect(post.body).toMatchObject({
+      media_type: "CAROUSEL_ALBUM",
+      caption: "Two views",
+      children: { data: [{ media_type: "IMAGE" }, { media_type: "VIDEO" }] },
+    });
+    const listed = await graph("GET", `${shop.id}/media`, { token });
+    expect(listed.body.data.map((entry) => entry.id)).toEqual([
+      published.body.id,
+    ]);
+    const limit = await graph("GET", `${shop.id}/content_publishing_limit`, {
+      token,
+    });
+    expect(limit.body.data[0].quota_usage).toBe(1);
+  });
+
+  it("refuses a carousel with fewer than 2 items, or with a container that is not an item", async () => {
+    const { create, item } = await publisher();
+    const photo = await item({ image_url: "https://example.com/a.jpg" });
+    const single = (await create({ image_url: "https://example.com/c.jpg" }))
+      .body.id;
+
+    const tooFew = await create({ media_type: "CAROUSEL", children: photo });
+    expect(tooFew.body.error).toMatchObject({
+      code: 100,
+      error_subcode: 2207028,
+    });
+    const notItem = await create({
+      media_type: "CAROUSEL",
+      children: `${photo},${single}`,
+    });
+    expect(notItem.status).toBe(400);
+  });
+});
+
+describe("mentions", () => {
+  async function twoAccounts() {
+    const callback = await startCallback();
+    const context = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: callback.verifyToken },
+    });
+    const brand = await context.server.createAccount({ username: "brand" });
+    const creator = await context.server.createAccount({ username: "creator" });
+    const token = (await context.login(brand.id)).long.access_token;
+    await context.graph("POST", "me/subscribed_apps", {
+      token,
+      form: { subscribed_fields: "mentions" },
+    });
+    const mentions = () =>
+      callback.deliveries
+        .flatMap((delivery) => delivery.body.entry)
+        .filter((entry) => entry.changes?.[0]?.field === "mentions");
+    return { ...context, brand, creator, token, mentions };
+  }
+
+  it("tells an account it was tagged in a comment elsewhere, and lets it read that comment", async () => {
+    const { server, graph, brand, creator, token, mentions } =
+      await twoAccounts();
+    const post = await server.postMedia(creator.id, { caption: "Outfit" });
+    const comment = await server.comment(post.id, {
+      username: "fan",
+      text: "Where is this from @Brand?",
+    });
+
+    await expect.poll(() => mentions().length).toBe(1);
+    expect(mentions()[0]).toMatchObject({
+      id: brand.user_id,
+      changes: [
+        {
+          field: "mentions",
+          value: { comment_id: comment.id, media_id: post.id },
+        },
+      ],
+    });
+    const read = await graph("GET", brand.user_id, {
+      token,
+      query: {
+        fields: `mentioned_comment.comment_id(${comment.id}){text,username}`,
+      },
+    });
+    expect(read.body.mentioned_comment).toMatchObject({
+      text: "Where is this from @Brand?",
+      username: "fan",
+    });
+    const direct = await graph("GET", comment.id, { token });
+    expect(direct.status).toBe(400);
+  });
+
+  it("tells an account it was tagged in a caption, but not about its own media", async () => {
+    const { server, graph, brand, creator, token, mentions } =
+      await twoAccounts();
+    const tagged = await server.postMedia(creator.id, {
+      caption: "Wearing @brand today",
+    });
+    await server.postMedia(brand.id, { caption: "New from @brand" });
+
+    await expect.poll(() => mentions().length).toBe(1);
+    expect(mentions()[0].changes[0].value).toEqual({ media_id: tagged.id });
+    const read = await graph("GET", brand.user_id, {
+      token,
+      query: { fields: `mentioned_media.media_id(${tagged.id}){caption}` },
+    });
+    expect(read.body.mentioned_media).toMatchObject({
+      caption: "Wearing @brand today",
+    });
+  });
+
+  it("refuses to read a comment that does not tag the account", async () => {
+    const { server, graph, brand, creator, token } = await twoAccounts();
+    const post = await server.postMedia(creator.id);
+    const comment = await server.comment(post.id, {
+      username: "fan",
+      text: "no tag here",
+    });
+    const read = await graph("GET", brand.user_id, {
+      token,
+      query: { fields: `mentioned_comment.comment_id(${comment.id}){text}` },
+    });
+    expect(read.status).toBe(400);
+  });
+});

@@ -460,10 +460,18 @@ export async function startTestServer({
       timestamp: iso(item.createdAt),
       owner: { id: item.owner },
       username: owner?.username,
-      media_url: fileUrl,
+      media_url: item.children ? undefined : fileUrl,
       thumbnail_url: item.media_type === "VIDEO" ? fileUrl : undefined,
       comments_count: liveComments(item.id).length,
       like_count: 0,
+      // An album's items, expanded with children{...}.
+      children: item.children
+        ? (sub) => ({
+            data: item.children.map((id) =>
+              select(mediaView(media.get(id)), sub ?? asFields(["id"])),
+            ),
+          })
+        : undefined,
     };
   }
 
@@ -481,6 +489,7 @@ export async function startTestServer({
         (item) =>
           item.owner === account.id &&
           !item.deleted &&
+          !item.parentId &&
           item.media_product_type !== "STORY",
       ).length,
     };
@@ -683,6 +692,12 @@ export async function startTestServer({
   function emitComment(comment) {
     const item = media.get(comment.mediaId);
     const account = accounts.get(item.owner);
+    void emitMentions({
+      text: comment.text,
+      mediaId: item.id,
+      commentId: comment.id,
+      except: [comment.from.id],
+    });
     return emit(
       account,
       "comments",
@@ -706,6 +721,50 @@ export async function startTestServer({
         ],
       },
       { commentId: comment.id },
+    );
+  }
+
+  /** The accounts a text tags with @username, other than `except`. */
+  function mentionedAccounts(text, except = []) {
+    const names = new Set(
+      [...String(text ?? "").matchAll(/@([A-Za-z0-9._]{1,30})/g)].map((match) =>
+        match[1].toLowerCase(),
+      ),
+    );
+    return [...accounts.values()].filter(
+      (account) =>
+        names.has(account.username.toLowerCase()) &&
+        !except.includes(account.id),
+    );
+  }
+
+  /**
+   * Meta's `mentions` change for each account a comment or caption tags, on
+   * media it does not own: the comment and media ids, or the media id alone
+   * for a caption.
+   */
+  function emitMentions({ text, mediaId, commentId = null, except = [] }) {
+    const item = media.get(mediaId);
+    return Promise.all(
+      mentionedAccounts(text, [item.owner, ...except]).map((account) =>
+        emit(
+          account,
+          "mentions",
+          {
+            id: account.id,
+            time: Math.floor(Date.now() / 1000),
+            changes: [
+              {
+                field: "mentions",
+                value: commentId
+                  ? { comment_id: commentId, media_id: mediaId }
+                  : { media_id: mediaId },
+              },
+            ],
+          },
+          commentId ? { commentId } : { mediaId },
+        ),
+      ),
     );
   }
 
@@ -890,6 +949,13 @@ export async function startTestServer({
         code: 100,
       });
     }
+    if (item.parentId) {
+      throw new GraphError(
+        400,
+        "(#100) Comments go on the carousel, not on one of its items",
+        { code: 100 },
+      );
+    }
     let parent = null;
     if (parentId) {
       parent = comments.get(String(parentId));
@@ -990,6 +1056,25 @@ export async function startTestServer({
     if (["ERROR", "EXPIRED", "PUBLISHED"].includes(container.statusCode))
       return;
     if (container.forced) return;
+    if (container.children) {
+      // A carousel is ready when every item is, and fails when one does.
+      if (Date.now() - container.createdAt > CONTAINER_LIFETIME_MS) {
+        container.statusCode = "EXPIRED";
+        return;
+      }
+      const items = container.children.map((id) => containers.get(id));
+      for (const child of items) {
+        child.polls += 1;
+        refreshContainer(child);
+      }
+      if (
+        items.some((child) => ["ERROR", "EXPIRED"].includes(child.statusCode))
+      )
+        container.statusCode = "ERROR";
+      else if (items.every((child) => child.statusCode === "FINISHED"))
+        container.statusCode = "FINISHED";
+      return;
+    }
     if (Date.now() - container.createdAt > CONTAINER_LIFETIME_MS) {
       container.statusCode = "EXPIRED";
       return;
@@ -1016,6 +1101,15 @@ export async function startTestServer({
 
   function createContainer(account, params) {
     const kind = String(params.media_type ?? "").toUpperCase();
+    if (kind === "CAROUSEL") return createCarousel(account, params);
+    const carouselItem = String(params.is_carousel_item) === "true";
+    if (carouselItem && !["", "IMAGE", "VIDEO"].includes(kind)) {
+      throw new GraphError(
+        400,
+        `(#100) A carousel item must be an image or a video, not ${kind}`,
+        { code: 100 },
+      );
+    }
     let productType;
     let mediaType;
     let sourceUrl;
@@ -1031,6 +1125,10 @@ export async function startTestServer({
       productType = "FEED";
       mediaType = "IMAGE";
       sourceUrl = params.image_url;
+    } else if (kind === "VIDEO" && carouselItem) {
+      productType = "FEED";
+      mediaType = "VIDEO";
+      sourceUrl = params.video_url;
     } else {
       throw new GraphError(400, `(#100) Unsupported media_type ${kind}`, {
         code: 100,
@@ -1055,7 +1153,10 @@ export async function startTestServer({
       productType,
       mediaType,
       sourceUrl,
-      caption: productType === "STORY" ? null : (params.caption ?? ""),
+      // A carousel item takes no caption; the carousel carries it.
+      caption:
+        productType === "STORY" || carouselItem ? null : (params.caption ?? ""),
+      carouselItem,
       statusCode: "IN_PROGRESS",
       createdAt: Date.now(),
       polls: 0,
@@ -1074,6 +1175,73 @@ export async function startTestServer({
     return container;
   }
 
+  /**
+   * A carousel: 2 to 10 finished-or-processing item containers of this
+   * account, published together as one CAROUSEL_ALBUM post.
+   */
+  function createCarousel(account, params) {
+    const ids = (
+      Array.isArray(params.children)
+        ? params.children
+        : String(params.children ?? "")
+            .replace(/^\[|\]$/g, "")
+            .split(",")
+    )
+      .map((id) => String(id).replace(/"/g, "").trim())
+      .filter(Boolean);
+    if (ids.length < 2 || ids.length > 10) {
+      throw new GraphError(
+        400,
+        "Carousels need at least 2 photos/videos and no more than 10.",
+        { code: 100, subcode: 2207028 },
+      );
+    }
+    const children = ids.map((id) => {
+      const child = containers.get(id);
+      if (!child || child.owner !== account.id) {
+        throw new GraphError(
+          400,
+          `The media builder with creation id = ${id} does not exist or has been expired.`,
+          { code: 24, subcode: 2207008 },
+        );
+      }
+      if (!child.carouselItem || child.statusCode === "PUBLISHED") {
+        throw new GraphError(
+          400,
+          `(#100) Container ${id} is not an unpublished carousel item`,
+          { code: 100 },
+        );
+      }
+      return child;
+    });
+    if (typeof params.caption === "string" && params.caption.length > 2200) {
+      throw new GraphError(400, "The caption is too long.", {
+        code: 36004,
+        subcode: 2207010,
+      });
+    }
+    const container = {
+      id: nextId("1791"),
+      owner: account.id,
+      productType: "FEED",
+      mediaType: "CAROUSEL_ALBUM",
+      sourceUrl: null,
+      caption: params.caption ?? "",
+      carouselItem: false,
+      children: children.map((child) => child.id),
+      statusCode: "IN_PROGRESS",
+      createdAt: Date.now(),
+      polls: 0,
+      pollsUntilFinished: 0,
+      downloaded: true,
+      downloadError: null,
+      forced: false,
+      mediaId: null,
+    };
+    containers.set(container.id, container);
+    return container;
+  }
+
   async function publishContainer(account, params) {
     const container = containers.get(String(params.creation_id ?? ""));
     const noContainer = () =>
@@ -1084,7 +1252,17 @@ export async function startTestServer({
       );
     if (!container || container.owner !== account.id) throw noContainer();
     await container.download;
+    for (const id of container.children ?? []) {
+      await containers.get(id).download;
+    }
     refreshContainer(container);
+    if (container.carouselItem) {
+      throw new GraphError(
+        400,
+        "(#100) A carousel item is published with its carousel, not alone",
+        { code: 100 },
+      );
+    }
     if (container.statusCode === "EXPIRED") throw noContainer();
     if (container.statusCode === "PUBLISHED") {
       throw new GraphError(
@@ -1116,10 +1294,68 @@ export async function startTestServer({
       sourceUrl: container.sourceUrl,
       containerId: container.id,
     });
+    // A carousel's items become media of their own, listed only under it.
+    item.children = (container.children ?? []).map((id) => {
+      const child = containers.get(id);
+      const part = createMedia(account, {
+        media_product_type: "FEED",
+        media_type: child.mediaType,
+        caption: null,
+        bytes: child.bytes,
+        contentType: child.contentType,
+        sourceUrl: child.sourceUrl,
+        containerId: child.id,
+      });
+      part.parentId = item.id;
+      child.statusCode = "PUBLISHED";
+      child.mediaId = part.id;
+      return part.id;
+    });
     container.statusCode = "PUBLISHED";
     container.mediaId = item.id;
+    // A carousel counts as one post against the quota.
     account.publishedAt.push(Date.now());
+    void emitMentions({ text: item.caption, mediaId: item.id });
     return { id: item.id };
+  }
+
+  /**
+   * mentioned_comment.comment_id(<id>){...} and mentioned_media.media_id(<id>)
+   * {...}: a comment or caption on someone else's media that tags the account,
+   * which its token cannot otherwise read.
+   */
+  function mentionedFields(account, grant, fields) {
+    const out = {};
+    for (const { name, sub } of fields) {
+      const match = name.match(
+        /^mentioned_(comment|media)\.(comment_id|media_id)\(([^)]*)\)$/,
+      );
+      if (!match) continue;
+      requireScope(grant, SCOPES.comments);
+      const [, kind, param, id] = match;
+      if (
+        (kind === "comment" && param !== "comment_id") ||
+        (kind === "media" && param !== "media_id")
+      ) {
+        throw new GraphError(400, `(#100) Unknown field ${name}`, {
+          code: 100,
+        });
+      }
+      const target = kind === "comment" ? comments.get(id) : media.get(id);
+      const text = kind === "comment" ? target?.text : target?.caption;
+      if (
+        !target ||
+        target.deleted ||
+        !mentionedAccounts(text).some((each) => each.id === account.id)
+      ) {
+        throw missingObject(id);
+      }
+      out[`mentioned_${kind}`] =
+        kind === "comment"
+          ? select(commentView(target), sub ?? asFields(["id"]))
+          : select(mediaView(target), sub ?? asFields(["id"]));
+    }
+    return out;
   }
 
   // ── Graph API ──────────────────────────────────────────────────────────
@@ -1246,6 +1482,7 @@ export async function startTestServer({
     if (method === "GET" && !edge) {
       if (kind === "account") {
         const view = select(accountView(node), fields ?? []);
+        Object.assign(view, mentionedFields(node, grant, fields ?? []));
         return nodeId === "me" ? { data: [view] } : view;
       }
       if (kind === "media") return select(mediaView(node), fields ?? []);
@@ -1261,12 +1498,20 @@ export async function startTestServer({
       }
     }
 
+    if (kind === "media" && method === "GET" && edge === "children") {
+      return {
+        data: (node.children ?? []).map((id) =>
+          select(mediaView(media.get(id)), fields ?? asFields(["id"])),
+        ),
+      };
+    }
     if (kind === "account" && method === "GET" && edge === "media") {
       const items = [...media.values()]
         .filter(
           (item) =>
             item.owner === node.id &&
             !item.deleted &&
+            !item.parentId &&
             item.media_product_type !== "STORY",
         )
         .sort((left, right) => compareIds(right.id, left.id));
@@ -1304,7 +1549,11 @@ export async function startTestServer({
             { code: 100 },
           );
         }
-        if (requested.includes("comments"))
+        if (
+          requested.some((field) =>
+            ["comments", "live_comments", "mentions"].includes(field),
+          )
+        )
           requireScope(grant, SCOPES.comments);
         if (
           requested.some(
@@ -1829,6 +2078,7 @@ export async function startTestServer({
           media_product_type: body.media_product_type,
           media_type: body.media_type,
         });
+        await emitMentions({ text: item.caption, mediaId: item.id });
         return mediaView(item);
       }
       if (sub === "media" && method === "GET") {
