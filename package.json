@@ -1,0 +1,50 @@
+{
+  "name": "instagram-graph-test-server",
+  "version": "0.1.0",
+  "description": "A local, in-memory fake of the Instagram Graph API (Instagram Login) for testing comment moderation, messaging and publishing without real accounts",
+  "license": "MIT",
+  "author": "Anatoly Ben",
+  "type": "module",
+  "engines": {
+    "node": ">=20.3"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "types": "./src/index.d.ts",
+  "bin": {
+    "instagram-graph-test-server": "bin/instagram-graph-test-server.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "instagram",
+    "instagram-graph-api",
+    "meta",
+    "webhooks",
+    "fake",
+    "mock",
+    "test-server",
+    "testing"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anatolyben/instagram-graph-test-server.git"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@chat-adapter/instagram": "^4.41.0",
+    "@chat-adapter/state-memory": "^4.41.0",
+    "chat": "^4.41.0",
+    "vitest": "^3.2.6"
+  }
+}

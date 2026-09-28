@@ -1,0 +1,921 @@
+import http from "node:http";
+import { createHmac } from "node:crypto";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { startTestServer } from "../src/index.js";
+
+const APP = {
+  id: "1234567890",
+  secret: "test-app-secret",
+  redirectUris: ["http://localhost:4000/instagram/callback"],
+};
+const SCOPES = [
+  "instagram_business_basic",
+  "instagram_business_manage_comments",
+  "instagram_business_content_publish",
+  "instagram_business_manage_messages",
+];
+
+const cleanups = [];
+afterEach(async () => {
+  while (cleanups.length) await cleanups.pop()();
+});
+
+/** A webhook callback that answers Meta's handshake and records deliveries. */
+async function startCallback({ verifyToken = "verify-me", status = 200 } = {}) {
+  const deliveries = [];
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url, "http://localhost");
+    if (request.method === "GET") {
+      const ok =
+        url.searchParams.get("hub.mode") === "subscribe" &&
+        url.searchParams.get("hub.verify_token") === verifyToken;
+      response
+        .writeHead(ok ? 200 : 403)
+        .end(ok ? url.searchParams.get("hub.challenge") : "");
+      return;
+    }
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      const raw = Buffer.concat(chunks);
+      deliveries.push({
+        raw,
+        headers: request.headers,
+        body: JSON.parse(raw.toString("utf8")),
+      });
+      response.writeHead(status).end();
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(
+    () =>
+      new Promise((resolve) => {
+        server.close(resolve);
+        server.closeAllConnections();
+      }),
+  );
+  return {
+    url: `http://127.0.0.1:${server.address().port}/webhook`,
+    verifyToken,
+    deliveries,
+  };
+}
+
+async function setup(options = {}) {
+  const server = await startTestServer({ app: APP, ...options });
+  cleanups.push(() => server.stop());
+
+  async function graph(method, path, { token, query = {}, form } = {}) {
+    const url = new URL(`/v25.0/${path}`, server.origin);
+    for (const [key, value] of Object.entries(query))
+      url.searchParams.set(key, value);
+    const response = await fetch(url, {
+      method,
+      headers: {
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(form
+          ? { "content-type": "application/x-www-form-urlencoded" }
+          : {}),
+      },
+      ...(form ? { body: new URLSearchParams(form) } : {}),
+    });
+    return {
+      status: response.status,
+      headers: response.headers,
+      body: await response.json(),
+    };
+  }
+
+  /** Run Instagram Business Login end to end and return a long-lived token. */
+  async function login(accountId, scopes = SCOPES) {
+    await server.setNextLogin({ account_id: accountId });
+    const authorize = new URL("/oauth/authorize", server.origin);
+    authorize.search = new URLSearchParams({
+      client_id: APP.id,
+      redirect_uri: APP.redirectUris[0],
+      response_type: "code",
+      scope: scopes.join(","),
+      state: "xyz",
+    });
+    const redirect = await fetch(authorize, { redirect: "manual" });
+    const back = new URL(redirect.headers.get("location"));
+    const exchange = await fetch(
+      new URL("/oauth/access_token", server.origin),
+      {
+        method: "POST",
+        body: new URLSearchParams({
+          client_id: APP.id,
+          client_secret: APP.secret,
+          grant_type: "authorization_code",
+          redirect_uri: APP.redirectUris[0],
+          code: back.searchParams.get("code"),
+        }),
+      },
+    );
+    const short = (await exchange.json()).data[0];
+    const longUrl = new URL("/access_token", server.origin);
+    longUrl.search = new URLSearchParams({
+      grant_type: "ig_exchange_token",
+      client_secret: APP.secret,
+      access_token: short.access_token,
+    });
+    const long = await (await fetch(longUrl)).json();
+    return { state: back.searchParams.get("state"), short, long };
+  }
+
+  return { server, graph, login };
+}
+
+describe("Instagram Business Login", () => {
+  it("exchanges a code for a short-lived token, then a long-lived one", async () => {
+    const { server, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+
+    const { state, short, long } = await login(account.id);
+
+    expect(state).toBe("xyz");
+    // user_id is the professional account id, which webhooks also use.
+    expect(short).toMatchObject({
+      user_id: account.user_id,
+      permissions: SCOPES.join(","),
+    });
+    expect(long).toMatchObject({
+      token_type: "bearer",
+      expires_in: expect.any(Number),
+    });
+  });
+
+  it("refuses to refresh a token less than a day old, and refreshes an older one", async () => {
+    const { server, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const { long } = await login(account.id);
+    const refresh = () =>
+      fetch(
+        new URL(
+          `/refresh_access_token?grant_type=ig_refresh_token&access_token=${long.access_token}`,
+          server.origin,
+        ),
+      );
+
+    expect((await refresh()).status).toBe(400);
+    await server.changeTokens(account.id, { age_hours: 25 });
+    expect(await (await refresh()).json()).toMatchObject({
+      token_type: "bearer",
+    });
+  });
+
+  it("answers Meta's token errors: missing, unparseable, revoked and expired", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const { long } = await login(account.id);
+
+    const missing = await graph("GET", "me");
+    expect(missing.status).toBe(400);
+    expect(missing.body.error).toMatchObject({
+      type: "IGApiException",
+      code: 190,
+      error_data: {},
+    });
+    expect(missing.headers.get("www-authenticate")).toContain(
+      "invalid_request",
+    );
+
+    expect(
+      (await graph("GET", "me", { token: "garbage" })).body.error,
+    ).toMatchObject({
+      type: "OAuthException",
+      code: 190,
+    });
+
+    await server.changeTokens(account.id, { revoke: true });
+    expect(
+      (await graph("GET", "me", { token: long.access_token })).body.error,
+    ).toMatchObject({
+      code: 190,
+      error_subcode: 458,
+    });
+
+    const other = await server.createAccount({ username: "second" });
+    const second = (await login(other.id)).long.access_token;
+    await server.changeTokens(other.id, { logout: true });
+    expect(
+      (await graph("GET", "me", { token: second })).body.error,
+    ).toMatchObject({
+      code: 190,
+      error_subcode: 460,
+    });
+  });
+
+  it("grants only the scopes the person approved", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const { long } = await login(account.id, ["instagram_business_basic"]);
+    const media = await server.postMedia(account.id);
+
+    const listed = await graph("GET", `${media.id}/comments`, {
+      token: long.access_token,
+    });
+    expect(listed.status).toBe(403);
+    expect(listed.body.error.code).toBe(10);
+  });
+});
+
+describe("comments", () => {
+  async function withComment(options) {
+    const context = await setup(options);
+    const account = await context.server.createAccount({ username: "shop" });
+    const { long } = await context.login(account.id);
+    const media = await context.server.postMedia(account.id, {
+      caption: "New drop",
+    });
+    const comment = await context.server.comment(media.id, {
+      username: "spammer",
+      text: "cheap followers at example.com",
+    });
+    return { ...context, account, token: long.access_token, media, comment };
+  }
+
+  it("reads, hides, unhides and deletes a comment, and records who did it", async () => {
+    const { server, graph, token, comment } = await withComment();
+
+    const read = await graph("GET", comment.id, {
+      token,
+      query: { fields: "text,hidden,from" },
+    });
+    expect(read.body).toMatchObject({
+      id: comment.id,
+      hidden: false,
+      from: { username: "spammer" },
+    });
+
+    await graph("POST", comment.id, { token, query: { hide: "true" } });
+    expect((await server.getComment(comment.id)).hidden).toBe(true);
+
+    await graph("POST", comment.id, { token, query: { hide: "false" } });
+    await graph("DELETE", comment.id, { token });
+    const final = await server.getComment(comment.id);
+    expect(final.deleted).toBe(true);
+    expect(final.history.map((entry) => entry.action)).toEqual([
+      "created",
+      "hidden",
+      "unhidden",
+      "deleted",
+    ]);
+  });
+
+  it("reads hide only from the query string, as Meta does", async () => {
+    const { server, graph, token, comment } = await withComment();
+
+    const bodyOnly = await graph("POST", comment.id, {
+      token,
+      form: { hide: "true" },
+    });
+
+    expect(bodyOnly.status).toBe(400);
+    expect((await server.getComment(comment.id)).hidden).toBe(false);
+  });
+
+  it("leaves the media owner's own comment visible when asked to hide it", async () => {
+    const { server, graph, token, media } = await withComment();
+    const own = await server.comment(media.id, {
+      as_owner: true,
+      text: "Thanks all",
+    });
+
+    expect(
+      (await graph("POST", own.id, { token, query: { hide: "true" } })).body,
+    ).toEqual({
+      success: true,
+    });
+    expect((await server.getComment(own.id)).hidden).toBe(false);
+  });
+
+  it("threads replies one level deep", async () => {
+    const { server, graph, token, media, comment } = await withComment();
+    const reply = await server.comment(media.id, {
+      username: "other",
+      text: "reply to the spam",
+      parent_id: comment.id,
+    });
+
+    const nested = await server.comment(media.id, {
+      username: "third",
+      text: "reply to the reply",
+      parent_id: reply.id,
+    });
+
+    expect(nested.parent_id).toBe(comment.id);
+    const replies = await graph("GET", `${comment.id}/replies`, { token });
+    expect(replies.body.data.map((item) => item.id)).toEqual([
+      reply.id,
+      nested.id,
+    ]);
+  });
+
+  it("pages through comments with Meta's cursors", async () => {
+    const { server, graph, token, media } = await withComment();
+    for (const text of ["one", "two", "three"]) {
+      await server.comment(media.id, { username: "fan", text });
+    }
+
+    const first = await graph("GET", `${media.id}/comments`, {
+      token,
+      query: { limit: "2" },
+    });
+    expect(first.body.data).toHaveLength(2);
+    expect(first.body.paging.next).toBeTruthy();
+    const second = await graph("GET", `${media.id}/comments`, {
+      token,
+      query: { limit: "2", after: first.body.paging.cursors.after },
+    });
+    expect(second.body.data).toHaveLength(2);
+  });
+});
+
+describe("webhooks", () => {
+  it("verifies the callback, then delivers signed comment events to subscribed accounts", async () => {
+    const callback = await startCallback();
+    const { server, graph, login } = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: callback.verifyToken },
+    });
+    const account = await server.createAccount({ username: "shop" });
+    const { long } = await login(account.id);
+    await graph("POST", "me/subscribed_apps", {
+      token: long.access_token,
+      form: { subscribed_fields: "comments" },
+    });
+    const media = await server.postMedia(account.id);
+
+    const posted = await server.comment(media.id, {
+      username: "fan",
+      text: "Nice! 😍",
+    });
+
+    expect(posted.webhook.delivered).toBe(true);
+    const [delivery] = callback.deliveries;
+    const expected = createHmac("sha256", APP.secret)
+      .update(delivery.raw)
+      .digest("hex");
+    expect(delivery.headers["x-hub-signature-256"]).toBe(`sha256=${expected}`);
+    expect(delivery.body).toMatchObject({
+      object: "instagram",
+      entry: [
+        {
+          id: account.user_id,
+          changes: [
+            {
+              field: "comments",
+              value: {
+                id: posted.id,
+                text: "Nice! 😍",
+                from: { username: "fan" },
+              },
+            },
+          ],
+        },
+      ],
+    });
+    // Meta escapes non-ASCII in the signed bytes.
+    expect(delivery.raw.toString("utf8")).toContain("\\ud83d\\ude0d");
+  });
+
+  it("sends nothing to a callback that fails the verification handshake", async () => {
+    const callback = await startCallback({ verifyToken: "right" });
+    const { server, graph, login } = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: "wrong" },
+    });
+    const account = await server.createAccount({ username: "shop" });
+    const { long } = await login(account.id);
+    await graph("POST", "me/subscribed_apps", {
+      token: long.access_token,
+      form: { subscribed_fields: "comments" },
+    });
+    const media = await server.postMedia(account.id);
+
+    const posted = await server.comment(media.id, {
+      username: "fan",
+      text: "hi",
+    });
+
+    expect(posted.webhook.skipped).toMatch(/not verified/);
+    expect(callback.deliveries).toHaveLength(0);
+  });
+
+  it("sends nothing for an account that has not subscribed to comments", async () => {
+    const callback = await startCallback();
+    const { server } = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: callback.verifyToken },
+    });
+    const account = await server.createAccount({ username: "shop" });
+    const media = await server.postMedia(account.id);
+
+    const posted = await server.comment(media.id, {
+      username: "fan",
+      text: "hi",
+    });
+
+    expect(posted.webhook.skipped).toMatch(/not subscribed/);
+  });
+});
+
+describe("publishing", () => {
+  it("publishes a container once it has finished, and counts it against the quota", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+
+    const container = await graph("POST", `${account.id}/media`, {
+      token,
+      form: { image_url: "https://example.com/photo.jpg", caption: "Launch" },
+    });
+    const status = await graph("GET", container.body.id, {
+      token,
+      query: { fields: "status_code" },
+    });
+    expect(status.body.status_code).toBe("FINISHED");
+
+    const published = await graph("POST", `${account.id}/media_publish`, {
+      token,
+      form: { creation_id: container.body.id },
+    });
+    expect(published.body.id).toBeTruthy();
+    const limit = await graph("GET", `${account.id}/content_publishing_limit`, {
+      token,
+    });
+    expect(limit.body.data[0].quota_usage).toBe(1);
+    const again = await graph("POST", `${account.id}/media_publish`, {
+      token,
+      form: { creation_id: container.body.id },
+    });
+    expect(again.status).toBe(400);
+  });
+
+  it("refuses to publish a container forced into ERROR, and past the quota", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+    const create = async () =>
+      (
+        await graph("POST", `${account.id}/media`, {
+          token,
+          form: { image_url: "https://example.com/photo.jpg" },
+        })
+      ).body.id;
+
+    const broken = await create();
+    await server.setContainerStatus(broken, "ERROR");
+    expect(
+      (
+        await graph("POST", `${account.id}/media_publish`, {
+          token,
+          form: { creation_id: broken },
+        })
+      ).status,
+    ).toBe(400);
+
+    await server.setQuotaUsage(account.id, 100);
+    const fine = await create();
+    const refused = await graph("POST", `${account.id}/media_publish`, {
+      token,
+      form: { creation_id: fine },
+    });
+    expect(refused.body.error).toMatchObject({ code: 9 });
+  });
+
+  it("does not fetch media URLs unless downloadMedia is enabled", async () => {
+    let fetched = 0;
+    const media = http.createServer((request, response) => {
+      fetched += 1;
+      response
+        .writeHead(200, { "content-type": "image/jpeg" })
+        .end(Buffer.from("jpg"));
+    });
+    await new Promise((resolve) => media.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise((resolve) => media.close(resolve)));
+    const imageUrl = `http://127.0.0.1:${media.address().port}/photo.jpg`;
+
+    for (const downloadMedia of [false, true]) {
+      const { server, graph, login } = await setup({ downloadMedia });
+      const account = await server.createAccount({ username: "shop" });
+      const token = (await login(account.id)).long.access_token;
+      const container = await graph("POST", `${account.id}/media`, {
+        token,
+        form: { image_url: imageUrl },
+      });
+      await graph("POST", `${account.id}/media_publish`, {
+        token,
+        form: { creation_id: container.body.id },
+      });
+    }
+
+    expect(fetched).toBe(1);
+  });
+});
+
+describe("messages and faults", () => {
+  it("records a private reply to a comment", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+    const media = await server.postMedia(account.id);
+    const comment = await server.comment(media.id, {
+      username: "fan",
+      text: "price?",
+    });
+
+    const sent = await graph("POST", "me/messages", {
+      token,
+      form: {
+        recipient: JSON.stringify({ comment_id: comment.id }),
+        message: JSON.stringify({ text: "Check your DMs" }),
+      },
+    });
+
+    // recipient_id is the commenter, not the comment.
+    expect(sent.body).toMatchObject({
+      recipient_id: comment.from.id,
+      message_id: expect.any(String),
+    });
+    const [recorded] = await server.getMessages();
+    expect(recorded).toMatchObject({
+      recipient: { comment_id: comment.id },
+      text: "Check your DMs",
+    });
+  });
+
+  it("injects a Graph error for the next matching call only", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+    await server.addFault({
+      method: "GET",
+      path: "/me$",
+      status: 500,
+      code: 2,
+    });
+
+    expect((await graph("GET", "me", { token })).status).toBe(500);
+    expect((await graph("GET", "me", { token })).status).toBe(200);
+  });
+});
+
+describe("messaging rules", () => {
+  async function account() {
+    const context = await setup();
+    const shop = await context.server.createAccount({ username: "shop" });
+    const token = (await context.login(shop.id)).long.access_token;
+    const send = (recipient, text = "hi") =>
+      context.graph("POST", "me/messages", {
+        token,
+        form: {
+          recipient: JSON.stringify(recipient),
+          message: JSON.stringify({ text }),
+        },
+      });
+    return { ...context, shop, token, send };
+  }
+
+  it("allows one private reply per comment, and none after 7 days", async () => {
+    const { server, shop, send } = await account();
+    const media = await server.postMedia(shop.id);
+    const first = await server.comment(media.id, {
+      username: "fan",
+      text: "price?",
+    });
+    const old = await server.comment(media.id, {
+      username: "fan2",
+      text: "price?",
+    });
+    await server.ageComment(old.id, 24 * 8);
+
+    expect((await send({ comment_id: first.id })).status).toBe(200);
+    const again = await send({ comment_id: first.id });
+    expect(again.body.error).toMatchObject({
+      code: 10,
+      error_subcode: 2534022,
+    });
+    expect((await send({ comment_id: old.id })).body.error).toMatchObject({
+      code: 10,
+    });
+  });
+
+  it("refuses a private reply to a comment on another account's media", async () => {
+    const { server, send } = await account();
+    const other = await server.createAccount({ username: "rival" });
+    const media = await server.postMedia(other.id);
+    const theirs = await server.comment(media.id, {
+      username: "fan",
+      text: "hi",
+    });
+
+    expect((await send({ comment_id: theirs.id })).body.error).toMatchObject({
+      code: 100,
+      error_subcode: 33,
+    });
+  });
+
+  it("lets the app message a person only within 24 hours of the person's last message", async () => {
+    const { server, shop, send } = await account();
+    const person = await server.createPerson({ username: "customer" });
+
+    expect((await send({ id: person.id })).body.error).toMatchObject({
+      code: 10,
+      error_subcode: 2534022,
+    });
+    await server.sendMessageToAccount(shop.id, {
+      person_id: person.id,
+      text: "hello?",
+    });
+    expect((await send({ id: person.id })).status).toBe(200);
+
+    await server.sendMessageToAccount(shop.id, {
+      person_id: person.id,
+      text: "old",
+      hours_ago: 30,
+    });
+    expect((await send({ id: person.id })).body.error).toMatchObject({
+      code: 10,
+    });
+    expect((await send({ id: "123" })).body.error).toMatchObject({
+      code: 100,
+      error_subcode: 2534014,
+    });
+  });
+
+  it("delivers a person's message as Meta's messages webhook, in milliseconds", async () => {
+    const callback = await startCallback();
+    const { server, graph, login } = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: callback.verifyToken },
+    });
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    await graph("POST", "me/subscribed_apps", {
+      token,
+      form: { subscribed_fields: "messages" },
+    });
+
+    const sent = await server.sendMessageToAccount(shop.id, {
+      username: "customer",
+      text: "hi",
+    });
+
+    expect(sent.webhook.delivered).toBe(true);
+    const [entry] = callback.deliveries[0].body.entry;
+    expect(entry).toMatchObject({
+      id: shop.user_id,
+      messaging: [
+        {
+          sender: { id: sent.person_id },
+          recipient: { id: shop.user_id },
+          message: { mid: sent.mid, text: "hi" },
+        },
+      ],
+    });
+    expect(entry.time).toBeGreaterThan(1e12);
+  });
+
+  it("returns a person's profile only after they messaged the account", async () => {
+    const { server, shop, graph, token } = await account();
+    const person = await server.createPerson({
+      username: "customer",
+      name: "Cus Tomer",
+    });
+
+    expect((await graph("GET", person.id, { token })).body.error.message).toBe(
+      "User consent is required to access user profile.",
+    );
+    await server.sendMessageToAccount(shop.id, {
+      person_id: person.id,
+      text: "hi",
+    });
+    expect(
+      (
+        await graph("GET", person.id, {
+          token,
+          query: { fields: "name,username" },
+        })
+      ).body,
+    ).toEqual({ id: person.id, name: "Cus Tomer", username: "customer" });
+  });
+});
+
+describe("Graph details", () => {
+  it("gives the account an app-scoped id and its professional account id as user_id", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+
+    const [me] = (
+      await graph("GET", "me", {
+        token,
+        query: { fields: "id,user_id,username" },
+      })
+    ).body.data;
+    expect(me.id).not.toBe(me.user_id);
+    // Both ids address the account.
+    expect(
+      (await graph("GET", me.user_id, { token, query: { fields: "username" } }))
+        .body.username,
+    ).toBe("shop");
+    expect(
+      (await graph("GET", me.id, { token, query: { fields: "username" } })).body
+        .username,
+    ).toBe("shop");
+  });
+
+  it("expands nested fields and replies", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const media = await server.postMedia(shop.id, {
+      media_product_type: "REELS",
+    });
+    const comment = await server.comment(media.id, {
+      username: "fan",
+      text: "top",
+    });
+    await server.comment(media.id, {
+      username: "fan2",
+      text: "reply",
+      parent_id: comment.id,
+    });
+
+    const listed = await graph("GET", `${media.id}/comments`, {
+      token,
+      query: {
+        fields:
+          "id,text,from{username},media{media_product_type},replies{text}",
+      },
+    });
+
+    expect(listed.body.data[0]).toEqual({
+      id: comment.id,
+      text: "top",
+      from: { username: "fan" },
+      media: { media_product_type: "REELS" },
+      replies: { data: [{ id: expect.any(String), text: "reply" }] },
+    });
+  });
+
+  it("accepts unversioned Graph paths and space-separated scopes", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (
+      await login(shop.id, [
+        "instagram_business_basic instagram_business_manage_comments",
+      ])
+    ).long.access_token;
+
+    const response = await fetch(
+      new URL("/me?fields=username", server.origin),
+      {
+        headers: { authorization: `Bearer ${token}` },
+      },
+    );
+    expect(response.status).toBe(200);
+    const media = await server.postMedia(shop.id);
+    expect((await graph("GET", `${media.id}/comments`, { token })).status).toBe(
+      200,
+    );
+  });
+
+  it("keeps paging after the last comment of a page is deleted", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const media = await server.postMedia(shop.id);
+    for (const text of ["a", "b", "c", "d"])
+      await server.comment(media.id, { username: "fan", text });
+
+    const first = await graph("GET", `${media.id}/comments`, {
+      token,
+      query: { limit: "2" },
+    });
+    await graph("DELETE", first.body.data[1].id, { token });
+    const second = await graph("GET", `${media.id}/comments`, {
+      token,
+      query: { limit: "2", after: first.body.paging.cursors.after },
+    });
+
+    expect(second.status).toBe(200);
+    expect(second.body.data.map((item) => item.text)).toEqual(["b", "a"]);
+  });
+
+  it("refuses a comment with no text, and a reply to a hidden comment", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const media = await server.postMedia(shop.id);
+    const comment = await server.comment(media.id, {
+      username: "fan",
+      text: "spam",
+    });
+
+    expect(
+      (await graph("POST", `${media.id}/comments`, { token, form: {} })).status,
+    ).toBe(400);
+    await graph("POST", comment.id, { token, query: { hide: "true" } });
+    expect(
+      (
+        await graph("POST", `${comment.id}/replies`, {
+          token,
+          form: { message: "hi" },
+        })
+      ).status,
+    ).toBe(400);
+  });
+
+  it("answers expired and unknown containers with Meta's error", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const container = await graph("POST", `${shop.id}/media`, {
+      token,
+      form: { image_url: "https://example.com/p.jpg" },
+    });
+    await server.setContainerStatus(container.body.id, "EXPIRED");
+
+    for (const creation_id of [container.body.id, "999"]) {
+      expect(
+        (
+          await graph("POST", `${shop.id}/media_publish`, {
+            token,
+            form: { creation_id },
+          })
+        ).body.error,
+      ).toMatchObject({ code: 24, error_subcode: 2207008 });
+    }
+  });
+});
+
+describe("robustness", () => {
+  it("answers 400, not a crash, to malformed paths and bodies", async () => {
+    const { server } = await setup();
+    for (const path of ["//v25.0/me", "/v25.0/%E0", "/_fake/files/%E0"]) {
+      const response = await fetch(server.origin + path);
+      expect(response.status).toBeLessThan(500);
+    }
+    const text = await fetch(new URL("/v25.0/me/comments", server.origin), {
+      method: "POST",
+      body: "plain",
+      headers: { "content-type": "text/plain", authorization: "Bearer x" },
+    });
+    expect(text.status).toBe(400);
+    // The server is still up.
+    expect((await fetch(server.origin + "/_fake/health")).status).toBe(200);
+  });
+
+  it("does not repeat ids across servers in the same run", async () => {
+    const ids = new Set();
+    for (let run = 0; run < 3; run += 1) {
+      const { server } = await setup();
+      const shop = await server.createAccount({ username: "shop" });
+      for (let index = 0; index < 20; index += 1)
+        ids.add((await server.postMedia(shop.id)).id);
+    }
+    expect(ids.size).toBe(60);
+  });
+
+  it("stops without delivering pending webhook retries afterwards", async () => {
+    const callback = await startCallback({ status: 500 });
+    const { server, graph, login } = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: callback.verifyToken },
+    });
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    await graph("POST", "me/subscribed_apps", {
+      token,
+      form: { subscribed_fields: "comments" },
+    });
+    const media = await server.postMedia(shop.id);
+    const commenting = server.comment(media.id, {
+      username: "fan",
+      text: "hi",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    await server.stop();
+    await commenting.catch(() => {});
+    const after = callback.deliveries.length;
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(callback.deliveries.length).toBe(after);
+  });
+
+  it("returns snapshots, not live state, from the helpers", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const media = await server.postMedia(shop.id);
+    const comment = await server.comment(media.id, {
+      username: "fan",
+      text: "hi",
+    });
+
+    const before = await server.getComment(comment.id);
+    await graph("POST", comment.id, { token, query: { hide: "true" } });
+
+    expect(before.hidden).toBe(false);
+    expect(before.history).toHaveLength(1);
+  });
+});
