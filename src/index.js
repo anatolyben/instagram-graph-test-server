@@ -44,6 +44,40 @@ const CONTAINER_STATUS = Object.freeze({
 const MAX_MEDIA_BYTES = 300 * 1024 * 1024;
 const MESSAGING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PRIVATE_REPLY_MS = 7 * 24 * 60 * 60 * 1000;
+// Meta's messaging limits per account: private replies to post and reel
+// comments per hour, and Send API calls per second.
+const PRIVATE_REPLIES_PER_HOUR = 750;
+const SENDS_PER_SECOND = 100;
+// The Business Use Case window a call limit counts over.
+const CALL_WINDOW_MS = 24 * 60 * 60 * 1000;
+// The webhook fields an account can subscribe to, as Meta lists them.
+const WEBHOOK_FIELDS = new Set([
+  "comments",
+  "live_comments",
+  "mentions",
+  "messages",
+  "message_reactions",
+  "message_echoes",
+  "messaging_postbacks",
+  "messaging_seen",
+  "messaging_referral",
+  "messaging_optins",
+  "messaging_handover",
+  "messaging_policy_enforcement",
+  "response_feedback",
+  "standby",
+  "story_insights",
+]);
+// What a person can send the account, in Meta's attachment types.
+const INCOMING_ATTACHMENTS = new Set([
+  "image",
+  "video",
+  "audio",
+  "file",
+  "share",
+  "story_mention",
+  "ig_reel",
+]);
 // Meta expects a webhook receiver to answer within 5 seconds.
 const WEBHOOK_TIMEOUT_MS = 5_000;
 
@@ -356,6 +390,12 @@ export async function startTestServer({
       subscribedFields: new Set(),
       publishedAt: [],
       extraQuotaUsage: 0,
+      // Calls the account's tokens may make in 24 hours (Meta's Business Use
+      // Case limit), or null for no limit; and the times of recent calls.
+      callLimit: null,
+      callTimes: [],
+      privateReplyTimes: [],
+      sendTimes: [],
     };
     accounts.set(account.id, account);
     accountsByScopedId.set(account.appScopedId, account);
@@ -669,26 +709,129 @@ export async function startTestServer({
     );
   }
 
-  /** A person's message to the account, as Meta's `messages` webhook. */
-  function emitMessage(account, message) {
+  /** The `message` object of a messaging webhook. */
+  function messagePayload(message, extra = {}) {
+    return {
+      mid: message.mid,
+      ...(message.text ? { text: message.text } : {}),
+      ...(message.attachments?.length
+        ? { attachments: message.attachments }
+        : {}),
+      ...(message.replyTo ? { reply_to: { mid: message.replyTo } } : {}),
+      ...extra,
+    };
+  }
+
+  /**
+   * One messaging event (a message, an echo, a deletion or a reaction) for an
+   * account, as Meta's messaging webhooks send it.
+   */
+  function emitMessaging(account, field, event, identity, at = Date.now()) {
     return emit(
       account,
-      "messages",
+      field,
       {
         // Messaging events carry milliseconds, unlike change events.
         id: account.id,
-        time: message.at,
-        messaging: [
-          {
-            sender: { id: message.personId },
-            recipient: { id: account.id },
-            timestamp: message.at,
-            message: { mid: message.mid, text: message.text },
-          },
-        ],
+        time: at,
+        messaging: [{ ...event, timestamp: at }],
+      },
+      identity,
+    );
+  }
+
+  /** A person's message to the account, as Meta's `messages` webhook. */
+  function emitMessage(account, message) {
+    return emitMessaging(
+      account,
+      "messages",
+      {
+        sender: { id: message.personId },
+        recipient: { id: account.id },
+        message: messagePayload(message),
       },
       { messageId: message.mid },
+      message.at,
     );
+  }
+
+  /**
+   * A message in one account's conversations, sent by a person or by the
+   * account, with the person it is with.
+   */
+  function conversationMessage(account, mid) {
+    const received = incoming.find(
+      (message) => message.accountId === account.id && message.mid === mid,
+    );
+    if (received) return { message: received, personId: received.personId };
+    const sent = messages.find(
+      (message) => message.from === account.id && message.message_id === mid,
+    );
+    if (sent) return { message: sent, personId: sent.recipient_id };
+    return null;
+  }
+
+  /** Drop times older than a window, and say how many are left. */
+  function recent(times, windowMs, now = Date.now()) {
+    while (times.length && times[0] <= now - windowMs) times.shift();
+    return times.length;
+  }
+
+  /**
+   * Meta's X-Business-Use-Case-Usage for an account: whole-number percentages
+   * of its call limit, and the minutes until a throttled account may call
+   * again.
+   */
+  function usageHeader(account) {
+    const now = Date.now();
+    const used = recent(account.callTimes, CALL_WINDOW_MS, now);
+    const percent = account.callLimit
+      ? Math.min(100, Math.floor((used * 100) / account.callLimit))
+      : 0;
+    const throttled = account.callLimit != null && used >= account.callLimit;
+    return JSON.stringify({
+      [account.id]: [
+        {
+          type: "instagram",
+          call_count: percent,
+          total_cputime: percent,
+          total_time: percent,
+          estimated_time_to_regain_access: throttled
+            ? Math.max(
+                1,
+                Math.ceil(
+                  (account.callTimes[0] + CALL_WINDOW_MS - now) / 60_000,
+                ),
+              )
+            : 0,
+        },
+      ],
+    });
+  }
+
+  /**
+   * Count a Graph call against its account's Business Use Case limit; a call
+   * over the limit is refused with Meta's code 80002.
+   */
+  function countCall(account) {
+    const used = recent(account.callTimes, CALL_WINDOW_MS);
+    if (account.callLimit != null && used >= account.callLimit) {
+      throw new GraphError(
+        400,
+        "There have been too many calls to this Instagram account. Wait a bit and try again.",
+        { code: 80002 },
+      );
+    }
+    account.callTimes.push(Date.now());
+  }
+
+  /** The account a Graph request's token belongs to, if the token is valid. */
+  function tokenAccount(value) {
+    try {
+      return requireToken(value).account;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1153,9 +1296,21 @@ export async function startTestServer({
             },
           );
         }
+        const unknown = requested.find((field) => !WEBHOOK_FIELDS.has(field));
+        if (unknown) {
+          throw new GraphError(
+            400,
+            `(#100) Param subscribed_fields must be one of {${[...WEBHOOK_FIELDS].join(", ")}} - got "${unknown}"`,
+            { code: 100 },
+          );
+        }
         if (requested.includes("comments"))
           requireScope(grant, SCOPES.comments);
-        if (requested.includes("messages"))
+        if (
+          requested.some(
+            (field) => field.startsWith("message") || field === "standby",
+          )
+        )
           requireScope(grant, SCOPES.messages);
         for (const field of requested) node.subscribedFields.add(field);
         return { success: true };
@@ -1200,6 +1355,23 @@ export async function startTestServer({
       };
       const recipient = asObject(params.recipient, "recipient");
       const message = asObject(params.message, "message");
+      const attachments = Array.isArray(message.attachments)
+        ? message.attachments
+        : message.attachment
+          ? [message.attachment]
+          : [];
+      if (!message.text && attachments.length === 0) {
+        throw new GraphError(
+          400,
+          "(#100) The parameter message must include text or an attachment",
+          { code: 100 },
+        );
+      }
+      const overLimit = () =>
+        new GraphError(400, "Calls to this api have exceeded the rate limit.", {
+          code: 613,
+          subcode: 2534040,
+        });
       const outsideWindow = () =>
         new GraphError(400, "This message is sent outside of allowed window.", {
           code: 10,
@@ -1224,6 +1396,13 @@ export async function startTestServer({
         ) {
           throw outsideWindow();
         }
+        if (
+          recent(node.privateReplyTimes, 60 * 60 * 1000) >=
+          PRIVATE_REPLIES_PER_HOUR
+        ) {
+          throw overLimit();
+        }
+        node.privateReplyTimes.push(Date.now());
         comment.privateReplied = true;
         recipientId = comment.from.id;
       } else {
@@ -1238,6 +1417,10 @@ export async function startTestServer({
         const last = lastIncoming.get(`${node.id}:${person.id}`);
         if (!last || Date.now() - last > MESSAGING_WINDOW_MS)
           throw outsideWindow();
+        if (recent(node.sendTimes, 1000) >= SENDS_PER_SECOND) {
+          throw overLimit();
+        }
+        node.sendTimes.push(Date.now());
         recipientId = person.id;
       }
       const sent = {
@@ -1246,9 +1429,25 @@ export async function startTestServer({
         from: node.id,
         recipient,
         text: message.text ?? null,
+        attachments,
         at: new Date().toISOString(),
       };
       messages.push(sent);
+      // Meta echoes every message the account sends back to the app, marked
+      // is_echo, to accounts subscribed to message_echoes.
+      void emitMessaging(
+        node,
+        "message_echoes",
+        {
+          sender: { id: node.id },
+          recipient: { id: recipientId },
+          message: messagePayload(
+            { mid: sent.message_id, text: sent.text, attachments },
+            { is_echo: true },
+          ),
+        },
+        { messageId: sent.message_id },
+      );
       return { recipient_id: sent.recipient_id, message_id: sent.message_id };
     }
 
@@ -1607,6 +1806,19 @@ export async function startTestServer({
           account.extraQuotaUsage = body.extra_quota_usage;
         }
         if (body.unsubscribe === true) account.subscribedFields.clear();
+        if (body.call_limit !== undefined) {
+          if (
+            body.call_limit !== null &&
+            !(Number.isInteger(body.call_limit) && body.call_limit >= 0)
+          ) {
+            throw new ControlError(
+              400,
+              "call_limit must be a whole number of calls, or null",
+            );
+          }
+          account.callLimit = body.call_limit;
+          account.callTimes = [];
+        }
         return { ok: true };
       }
       if (sub === "media" && method === "POST") {
@@ -1657,6 +1869,7 @@ export async function startTestServer({
       resource === "accounts" &&
       id &&
       sub === "messages" &&
+      !parts[3] &&
       method === "POST"
     ) {
       // A person messages the account. hours_ago backdates it, to test the
@@ -1669,17 +1882,123 @@ export async function startTestServer({
       if (!person)
         throw new ControlError(404, `No fake person ${body.person_id}`);
       const hoursAgo = Number(body.hours_ago ?? 0);
+      const attachments = (
+        Array.isArray(body.attachments) ? body.attachments : []
+      ).map((attachment) => {
+        if (!INCOMING_ATTACHMENTS.has(attachment?.type)) {
+          throw new ControlError(
+            400,
+            `attachment type must be one of ${[...INCOMING_ATTACHMENTS].join(", ")}`,
+          );
+        }
+        return {
+          type: attachment.type,
+          payload: {
+            url: String(
+              attachment.url ??
+                `https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=${nextId("")}`,
+            ),
+          },
+        };
+      });
+      const text = String(body.text ?? "");
+      if (!text && attachments.length === 0) {
+        throw new ControlError(400, "A message needs text or attachments");
+      }
+      let replyTo = null;
+      if (body.reply_to != null) {
+        const original = conversationMessage(account, String(body.reply_to));
+        if (!original || original.personId !== person.id) {
+          throw new ControlError(
+            404,
+            `No message ${body.reply_to} in this conversation`,
+          );
+        }
+        replyTo = String(body.reply_to);
+      }
       const message = {
         mid: `aWdf${randomBytes(12).toString("base64url")}`,
         personId: person.id,
         accountId: account.id,
-        text: String(body.text ?? ""),
+        text,
+        attachments,
+        replyTo,
         at: Date.now() - (Number.isFinite(hoursAgo) ? hoursAgo : 0) * 3_600_000,
       };
       incoming.push(message);
       lastIncoming.set(`${account.id}:${person.id}`, message.at);
       const webhookResult = await emitMessage(account, message);
       return { mid: message.mid, person_id: person.id, webhook: webhookResult };
+    }
+    if (
+      resource === "accounts" &&
+      id &&
+      sub === "messages" &&
+      parts[3] &&
+      parts[4] === "delete" &&
+      method === "POST"
+    ) {
+      // The person unsends their message; Meta tells the app it was deleted.
+      const account = requireAccount(id);
+      const message = incoming.find(
+        (entry) => entry.accountId === account.id && entry.mid === parts[3],
+      );
+      if (!message) {
+        throw new ControlError(404, `No message ${parts[3]} from a person`);
+      }
+      message.deleted = true;
+      return {
+        webhook: await emitMessaging(
+          account,
+          "messages",
+          {
+            sender: { id: message.personId },
+            recipient: { id: account.id },
+            message: { mid: message.mid, is_deleted: true },
+          },
+          { messageId: message.mid },
+        ),
+      };
+    }
+    if (
+      resource === "accounts" &&
+      id &&
+      sub === "messages" &&
+      parts[3] &&
+      parts[4] === "reactions" &&
+      method === "POST"
+    ) {
+      // The person in the conversation reacts to a message, or takes the
+      // reaction back.
+      const account = requireAccount(id);
+      const found = conversationMessage(account, parts[3]);
+      if (!found) {
+        throw new ControlError(404, `No message ${parts[3]} in a conversation`);
+      }
+      const action = body.action ?? "react";
+      if (action !== "react" && action !== "unreact") {
+        throw new ControlError(400, 'action must be "react" or "unreact"');
+      }
+      return {
+        webhook: await emitMessaging(
+          account,
+          "message_reactions",
+          {
+            sender: { id: found.personId },
+            recipient: { id: account.id },
+            reaction:
+              action === "react"
+                ? {
+                    mid: parts[3],
+                    action,
+                    reaction: String(body.reaction ?? "love"),
+                    emoji: String(body.emoji ?? "❤️"),
+                  }
+                : { mid: parts[3], action },
+          },
+          { messageId: parts[3] },
+        ),
+      };
     }
     if (
       resource === "accounts" &&
@@ -1840,6 +2159,7 @@ export async function startTestServer({
             "An unexpected error has occurred. Please retry your request later.",
         ),
         code: Number(body.code ?? 2),
+        subcode: body.subcode == null ? undefined : Number(body.subcode),
         times: Number(body.times ?? 1),
         apply: body.apply === true,
       });
@@ -2033,10 +2353,23 @@ export async function startTestServer({
           ? query
           : { ...query, ...(await bodyParams(request, body)) };
       const fault = takeFault(request.method, url.pathname);
+      // Every call a valid token makes counts against its account's limit and
+      // is answered with the account's usage, as Meta does.
+      const caller = tokenAccount(tokenFrom(request, params));
+      if (caller) {
+        try {
+          countCall(caller);
+        } finally {
+          response.setHeader("X-Business-Use-Case-Usage", usageHeader(caller));
+        }
+      }
       if (fault && !fault.apply) {
         sendGraphError(
           response,
-          new GraphError(fault.status, fault.message, { code: fault.code }),
+          new GraphError(fault.status, fault.message, {
+            code: fault.code,
+            subcode: fault.subcode,
+          }),
         );
         return;
       }
@@ -2053,7 +2386,10 @@ export async function startTestServer({
         // The change was made; the answer to it is lost.
         sendGraphError(
           response,
-          new GraphError(fault.status, fault.message, { code: fault.code }),
+          new GraphError(fault.status, fault.message, {
+            code: fault.code,
+            subcode: fault.subcode,
+          }),
         );
         return;
       }
@@ -2122,6 +2458,12 @@ export async function startTestServer({
     getMessages: () => act("GET", "messages"),
     sendMessageToAccount: (accountId, fields) =>
       act("POST", `accounts/${accountId}/messages`, fields),
+    deleteMessage: (accountId, mid) =>
+      act("POST", `accounts/${accountId}/messages/${mid}/delete`),
+    reactToMessage: (accountId, mid, reaction = {}) =>
+      act("POST", `accounts/${accountId}/messages/${mid}/reactions`, reaction),
+    setCallLimit: (accountId, limit) =>
+      act("POST", `accounts/${accountId}`, { call_limit: limit }),
     ageComment: (commentId, hours) =>
       act("POST", `comments/${commentId}/age`, { hours }),
     addFault: (fault) => act("POST", "faults", fault),

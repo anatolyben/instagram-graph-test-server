@@ -91,16 +91,52 @@ export interface TestServer {
   /**
    * The person messages the account (a new person when only username is given),
    * opening the 24-hour window for the app to reply. hours_ago backdates it.
+   * A message needs text or attachments; reply_to is the mid it answers.
    */
   sendMessageToAccount(
     accountId: string,
     fields: {
-      text: string;
+      text?: string;
+      attachments?: Array<{
+        type:
+          | "image"
+          | "video"
+          | "audio"
+          | "file"
+          | "share"
+          | "story_mention"
+          | "ig_reel";
+        url?: string;
+      }>;
+      reply_to?: string;
       username?: string;
       person_id?: string;
       hours_ago?: number;
     },
   ): Promise<{ mid: string; person_id: string; webhook: WebhookDelivery }>;
+  /** The person unsends their message; the app gets it with is_deleted. */
+  deleteMessage(
+    accountId: string,
+    mid: string,
+  ): Promise<{ webhook: WebhookDelivery }>;
+  /**
+   * The person in the conversation reacts to a message (default "love", ❤️),
+   * or takes the reaction back with action "unreact".
+   */
+  reactToMessage(
+    accountId: string,
+    mid: string,
+    reaction?: {
+      action?: "react" | "unreact";
+      reaction?: string;
+      emoji?: string;
+    },
+  ): Promise<{ webhook: WebhookDelivery }>;
+  /**
+   * Calls the account's tokens may make in 24 hours before Meta's code 80002,
+   * or null for no limit. Setting it starts the count again.
+   */
+  setCallLimit(accountId: string, limit: number | null): Promise<unknown>;
   /** Backdate a comment by some hours, e.g. past the 7-day private-reply limit. */
   ageComment(commentId: string, hours: number): Promise<CommentState>;
   /**
@@ -173,6 +209,7 @@ export interface TestServer {
     status?: number;
     message?: string;
     code?: number;
+    subcode?: number;
     times?: number;
     apply?: boolean;
   }): Promise<unknown>;

@@ -87,25 +87,28 @@ The login page at `/oauth/authorize` is a real page: open it in a browser and pi
 `startTestServer()` returns the server with these actions. The same actions are available over HTTP
 under `${origin}/_fake/` for tests written in other languages.
 
-| Action                                                                        | What happens                                                                                                            |
-| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `createAccount({ username, name, account_type })`                             | A professional account the app can log in as.                                                                           |
-| `setNextLogin({ account_id, grant })`                                         | The next login page allows as that account, optionally granting only some scopes. `{ deny: true }` cancels.             |
-| `changeTokens(accountId, { age_hours, expire, revoke, logout })`              | Age or expire the account's tokens, or invalidate them as a removed app (`revoke`) or an ended session (`logout`) does. |
-| `postMedia(accountId, { caption, media_product_type })`                       | The account posts outside the app (`FEED`, `REELS` or `STORY`).                                                         |
-| `comment(mediaId, { text, username \| person_id \| as_owner, parent_id })`    | Someone comments or replies; resolves after the webhook was sent, skipped or failed.                                    |
-| `editComment(commentId, text)`, `deleteComment(commentId)`                    | The author edits or deletes their comment. Meta sends no webhook for either.                                            |
-| `getComment(commentId)`, `getComments(mediaId)`                               | A comment's state (`hidden`, `deleted`) and its history: who hid, unhid or deleted it and when.                         |
-| `sendMessageToAccount(accountId, { text, username \| person_id, hours_ago })` | Someone messages the account, opening the 24-hour window for the app to reply; `hours_ago` backdates it.                |
-| `getMessages()`                                                               | Messages and private replies the app sent.                                                                              |
-| `ageComment(commentId, hours)`                                                | Backdate a comment, e.g. past the 7-day private-reply limit.                                                            |
-| `setContainerStatus(containerId, status)`                                     | Force a publishing container to `IN_PROGRESS`, `FINISHED`, `ERROR`, `EXPIRED` or `PUBLISHED`.                           |
-| `setQuotaUsage(accountId, used)`                                              | Use up the account's publishing quota.                                                                                  |
-| `getContainers()`, `getMedia(accountId)`                                      | What the app created and published.                                                                                     |
-| `addFault({ method, path, status, code, times, apply })`                      | Fail the next matching Graph calls; with `apply`, the change is made but the answer is still an error.                  |
-| `getWebhook()`, `verifyWebhook()`                                             | The callback, whether it passed verification, and every delivery attempt.                                               |
-| `getCalls()`                                                                  | Every call the app made, and any Graph calls this server does not model.                                                |
-| `stop()`                                                                      | Shut the server down.                                                                                                   |
+| Action                                                                                               | What happens                                                                                                                                                               |
+| ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createAccount({ username, name, account_type })`                                                    | A professional account the app can log in as.                                                                                                                              |
+| `setNextLogin({ account_id, grant })`                                                                | The next login page allows as that account, optionally granting only some scopes. `{ deny: true }` cancels.                                                                |
+| `changeTokens(accountId, { age_hours, expire, revoke, logout })`                                     | Age or expire the account's tokens, or invalidate them as a removed app (`revoke`) or an ended session (`logout`) does.                                                    |
+| `postMedia(accountId, { caption, media_product_type })`                                              | The account posts outside the app (`FEED`, `REELS` or `STORY`).                                                                                                            |
+| `comment(mediaId, { text, username \| person_id \| as_owner, parent_id })`                           | Someone comments or replies; resolves after the webhook was sent, skipped or failed.                                                                                       |
+| `editComment(commentId, text)`, `deleteComment(commentId)`                                           | The author edits or deletes their comment. Meta sends no webhook for either.                                                                                               |
+| `getComment(commentId)`, `getComments(mediaId)`                                                      | A comment's state (`hidden`, `deleted`) and its history: who hid, unhid or deleted it and when.                                                                            |
+| `sendMessageToAccount(accountId, { text, attachments, reply_to, username \| person_id, hours_ago })` | Someone messages the account, opening the 24-hour window for the app to reply; `attachments` are `{ type, url }`, `reply_to` the `mid` answered, `hours_ago` backdates it. |
+| `deleteMessage(accountId, mid)`                                                                      | The person unsends their message; the app gets it with `is_deleted`.                                                                                                       |
+| `reactToMessage(accountId, mid, { action, reaction, emoji })`                                        | The person reacts to a message in the conversation, or (`action: "unreact"`) takes the reaction back.                                                                      |
+| `setCallLimit(accountId, limit)`                                                                     | Calls the account's tokens may make in 24 hours before Meta's rate-limit error; `null` for no limit.                                                                       |
+| `getMessages()`                                                                                      | Messages and private replies the app sent.                                                                                                                                 |
+| `ageComment(commentId, hours)`                                                                       | Backdate a comment, e.g. past the 7-day private-reply limit.                                                                                                               |
+| `setContainerStatus(containerId, status)`                                                            | Force a publishing container to `IN_PROGRESS`, `FINISHED`, `ERROR`, `EXPIRED` or `PUBLISHED`.                                                                              |
+| `setQuotaUsage(accountId, used)`                                                                     | Use up the account's publishing quota.                                                                                                                                     |
+| `getContainers()`, `getMedia(accountId)`                                                             | What the app created and published.                                                                                                                                        |
+| `addFault({ method, path, status, code, subcode, times, apply })`                                    | Fail the next matching Graph calls; with `apply`, the change is made but the answer is still an error.                                                                     |
+| `getWebhook()`, `verifyWebhook()`                                                                    | The callback, whether it passed verification, and every delivery attempt.                                                                                                  |
+| `getCalls()`                                                                                         | Every call the app made, and any Graph calls this server does not model.                                                                                                   |
+| `stop()`                                                                                             | Shut the server down.                                                                                                                                                      |
 
 ## What it models
 
@@ -136,10 +139,20 @@ under `${origin}/_fake/` for tests written in other languages.
   the commenter, and is allowed once per comment within 7 days. Meta documents these rules but not the
   error for breaking the private-reply ones; this server answers code 10, subcode 2534022, the
   documented messaging-window error.
+- **Messaging webhooks.** A person's messages arrive under `messages` with their `attachments` and
+  `reply_to`, and an unsent one as `is_deleted`. Every message the app sends comes back under
+  `message_echoes` with `is_echo: true`, and reactions under `message_reactions`, each only to
+  accounts subscribed to that field. Subscribing to a field Meta does not have fails.
+- **Rate limits.** Every call with a valid token answers with Meta's `X-Business-Use-Case-Usage`
+  header for its account. With `setCallLimit`, calls over the limit in 24 hours fail with code 80002
+  and the header's `estimated_time_to_regain_access`. Private replies are limited to 750 an hour and
+  Send API messages to 100 a second (code 613, subcode 2534040). App-level throttling (codes 4, 17, 32) is an injected fault: `addFault` takes a `subcode`.
 
 ## What it does not do
 
-- Message attachments, reactions, read receipts, echoes and the Human Agent tag.
+- The app's own reactions and attachment uploads, read receipts, postbacks and the Human Agent tag.
+- Meta's real call budget, which depends on the account's impressions: there is no limit until a
+  test sets one.
 - `mentions`, `live_comments` and story webhooks; insights; hashtags; business discovery; Facebook Login
   for Business (`graph.facebook.com`).
 - **Media downloads, unless you ask.** Meta downloads the file a container names. This server only does
@@ -148,8 +161,13 @@ under `${origin}/_fake/` for tests written in other languages.
   (for example, the daily publishing limit is given as both 50 and 100), this server follows the most
   consistent documented behaviour. The `/me` response is wrapped in `data` because Meta's own example
   shows it that way. It is a test tool, not a guarantee of how Meta will answer.
-- Rate limits and usage headers.
 - Anything security-related. Bind it to localhost and never expose it to a network you do not control.
+
+## Changes
+
+- **0.2.0**: messaging webhooks for attachments, replies, unsent messages, echoes and reactions;
+  subscribed fields checked against Meta's list; the usage header, call limits and Meta's messaging
+  rate limits; injected faults take a subcode.
 
 ## Development
 

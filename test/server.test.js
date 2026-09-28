@@ -919,3 +919,262 @@ describe("robustness", () => {
     expect(before.history).toHaveLength(1);
   });
 });
+
+describe("messaging events", () => {
+  /** An account subscribed to the given fields, with a recording callback. */
+  async function subscribed(fields) {
+    const callback = await startCallback();
+    const context = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: callback.verifyToken },
+    });
+    const shop = await context.server.createAccount({ username: "shop" });
+    const token = (await context.login(shop.id)).long.access_token;
+    const subscribe = await context.graph("POST", "me/subscribed_apps", {
+      token,
+      form: { subscribed_fields: fields },
+    });
+    expect(subscribe.body).toEqual({ success: true });
+    const events = (field) =>
+      callback.deliveries
+        .flatMap((delivery) => delivery.body.entry)
+        .flatMap((entry) => entry.messaging ?? [])
+        .filter((event) =>
+          field === "reaction" ? event.reaction : event.message,
+        );
+    return { ...context, callback, shop, token, events };
+  }
+
+  it("echoes the account's own sends to accounts subscribed to message_echoes", async () => {
+    const { server, graph, token, shop, events } = await subscribed(
+      "messages,message_echoes",
+    );
+    const incoming = await server.sendMessageToAccount(shop.id, {
+      username: "customer",
+      text: "look",
+      attachments: [{ type: "image", url: "https://example.com/a.jpg" }],
+    });
+    const reply = await server.sendMessageToAccount(shop.id, {
+      person_id: incoming.person_id,
+      text: "this one",
+      reply_to: incoming.mid,
+    });
+    expect(reply.webhook.delivered).toBe(true);
+
+    const sent = await graph("POST", "me/messages", {
+      token,
+      form: {
+        recipient: JSON.stringify({ id: incoming.person_id }),
+        message: JSON.stringify({ text: "Thanks!" }),
+      },
+    });
+    await expect
+      .poll(() => events("message").some((event) => event.message.is_echo))
+      .toBe(true);
+
+    const [image, answer, echo] = events("message");
+    expect(image.message).toEqual({
+      mid: incoming.mid,
+      text: "look",
+      attachments: [
+        { type: "image", payload: { url: "https://example.com/a.jpg" } },
+      ],
+    });
+    expect(answer.message).toMatchObject({ reply_to: { mid: incoming.mid } });
+    expect(echo).toMatchObject({
+      sender: { id: shop.user_id },
+      recipient: { id: incoming.person_id },
+      message: { mid: sent.body.message_id, text: "Thanks!", is_echo: true },
+    });
+  });
+
+  it("sends no echo to an account subscribed to messages only", async () => {
+    const { server, graph, token, shop, events } = await subscribed("messages");
+    const incoming = await server.sendMessageToAccount(shop.id, {
+      username: "customer",
+      text: "hi",
+    });
+    await graph("POST", "me/messages", {
+      token,
+      form: {
+        recipient: JSON.stringify({ id: incoming.person_id }),
+        message: JSON.stringify({ text: "hello" }),
+      },
+    });
+    await expect
+      .poll(async () =>
+        (await server.getWebhook()).deliveries.some(
+          (delivery) => delivery.field === "message_echoes",
+        ),
+      )
+      .toBe(true);
+    const echo = (await server.getWebhook()).deliveries.find(
+      (delivery) => delivery.field === "message_echoes",
+    );
+    expect(echo.skipped).toBe("account is not subscribed to message_echoes");
+    expect(events("message").map((event) => event.message.text)).toEqual([
+      "hi",
+    ]);
+  });
+
+  it("tells the app when a person unsends a message, and when they react to one", async () => {
+    const { server, graph, token, shop, events } = await subscribed(
+      "messages,message_reactions",
+    );
+    const incoming = await server.sendMessageToAccount(shop.id, {
+      username: "customer",
+      text: "oops",
+    });
+    const sent = await graph("POST", "me/messages", {
+      token,
+      form: {
+        recipient: JSON.stringify({ id: incoming.person_id }),
+        message: JSON.stringify({ text: "Here is the link" }),
+      },
+    });
+
+    await server.deleteMessage(shop.id, incoming.mid);
+    await server.reactToMessage(shop.id, sent.body.message_id, {
+      reaction: "love",
+      emoji: "❤️",
+    });
+    await server.reactToMessage(shop.id, sent.body.message_id, {
+      action: "unreact",
+    });
+
+    expect(events("message").at(-1)).toMatchObject({
+      sender: { id: incoming.person_id },
+      message: { mid: incoming.mid, is_deleted: true },
+    });
+    expect(events("reaction").map((event) => event.reaction)).toEqual([
+      {
+        mid: sent.body.message_id,
+        action: "react",
+        reaction: "love",
+        emoji: "❤️",
+      },
+      { mid: sent.body.message_id, action: "unreact" },
+    ]);
+    expect(events("reaction")[0].sender).toEqual({ id: incoming.person_id });
+  });
+
+  it("refuses a webhook field Meta does not have", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const answer = await graph("POST", "me/subscribed_apps", {
+      token,
+      form: { subscribed_fields: "messages,messaging_reactions" },
+    });
+    expect(answer.status).toBe(400);
+    expect(answer.body.error).toMatchObject({ code: 100 });
+    expect(answer.body.error.message).toMatch(/messaging_reactions/);
+  });
+});
+
+describe("rate limits", () => {
+  it("reports an account's usage and refuses calls over its limit with code 80002", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    await server.setCallLimit(shop.id, 4);
+
+    const usage = async () => {
+      const answer = await graph("GET", "me", { token });
+      return {
+        status: answer.status,
+        code: answer.body.error?.code,
+        usage: JSON.parse(answer.headers.get("x-business-use-case-usage"))[
+          shop.user_id
+        ][0],
+      };
+    };
+    expect(await usage()).toMatchObject({
+      status: 200,
+      usage: { type: "instagram", call_count: 25 },
+    });
+    await usage();
+    await usage();
+    expect((await usage()).usage.call_count).toBe(100);
+    const refused = await usage();
+    expect(refused).toMatchObject({ status: 400, code: 80002 });
+    expect(refused.usage.estimated_time_to_regain_access).toBeGreaterThan(0);
+
+    await server.setCallLimit(shop.id, null);
+    expect(await usage()).toMatchObject({
+      status: 200,
+      usage: { call_count: 0, estimated_time_to_regain_access: 0 },
+    });
+  });
+
+  it("limits private replies to 750 an hour", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const post = await server.postMedia(shop.id);
+    const reply = async () => {
+      const comment = await server.comment(post.id, {
+        username: "fan",
+        text: "info?",
+      });
+      return graph("POST", "me/messages", {
+        token,
+        form: {
+          recipient: JSON.stringify({ comment_id: comment.id }),
+          message: JSON.stringify({ text: "Sent you a DM" }),
+        },
+      });
+    };
+    for (let count = 0; count < 750; count += 1) {
+      expect((await reply()).status).toBe(200);
+    }
+    const refused = await reply();
+    expect(refused.body.error).toMatchObject({
+      code: 613,
+      error_subcode: 2534040,
+    });
+  }, 60_000);
+
+  it("limits Send API messages to 100 a second", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const { person_id: personId } = await server.sendMessageToAccount(shop.id, {
+      username: "customer",
+      text: "hi",
+    });
+    const answers = await Promise.all(
+      Array.from({ length: 110 }, () =>
+        graph("POST", "me/messages", {
+          token,
+          form: {
+            recipient: JSON.stringify({ id: personId }),
+            message: JSON.stringify({ text: "hello" }),
+          },
+        }),
+      ),
+    );
+    const refused = answers.filter((answer) => answer.status !== 200);
+    expect(refused.length).toBeGreaterThanOrEqual(10);
+    expect(refused[0].body.error).toMatchObject({
+      code: 613,
+      error_subcode: 2534040,
+    });
+  });
+
+  it("answers an injected error with its subcode", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    await server.addFault({
+      path: "/me$",
+      status: 400,
+      code: 4,
+      subcode: 2207051,
+      message: "We restrict certain activity to protect our community.",
+    });
+    expect((await graph("GET", "me", { token })).body.error).toMatchObject({
+      code: 4,
+      error_subcode: 2207051,
+    });
+  });
+});
