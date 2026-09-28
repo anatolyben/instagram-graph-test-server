@@ -111,6 +111,9 @@ under `${origin}/_fake/` for tests written in other languages.
 | `editComment(commentId, text)`, `deleteComment(commentId)`                                           | The author edits or deletes their comment. Meta sends no webhook for either.                                                                                               |
 | `getComment(commentId)`, `getComments(mediaId)`                                                      | A comment's state (`hidden`, `deleted`) and its history: who hid, unhid or deleted it and when.                                                                            |
 | `sendMessageToAccount(accountId, { text, attachments, reply_to, username \| person_id, hours_ago })` | Someone messages the account, opening the 24-hour window for the app to reply; `attachments` are `{ type, url }`, `reply_to` the `mid` answered, `hours_ago` backdates it. |
+| `sendAsOwner(accountId, { text, person_id \| username })`                                            | The owner writes from the Instagram app: only a `message_echoes` echo, and no 24-hour window. Returns `{ mid, person_id, webhook }`.                                       |
+| `redeliverMessage(mid)`                                                                              | Send that message's or echo's webhook again, with the same body and signature.                                                                                             |
+| `updatePerson(personId, { is_user_follow_business, is_business_follow_user })`                       | Change who follows whom.                                                                                                                                                   |
 | `deleteMessage(accountId, mid)`                                                                      | The person unsends their message; the app gets it with `is_deleted`.                                                                                                       |
 | `reactToMessage(accountId, mid, { action, reaction, emoji })`                                        | The person reacts to a message in the conversation, or (`action: "unreact"`) takes the reaction back.                                                                      |
 | `setCallLimit(accountId, limit)`                                                                     | Calls the account's tokens may make in 24 hours before Meta's rate-limit error; `null` for no limit.                                                                       |
@@ -129,28 +132,31 @@ under `${origin}/_fake/` for tests written in other languages.
 The test actions above, over HTTP, for tests written in other languages. All routes live under
 `${origin}/_fake/` and take and return JSON.
 
-| Route                                       | Effect                                                                                                 |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `POST accounts`                             | Create an account `{ username, name?, account_type? }`.                                                |
-| `GET accounts/:id`                          | The account with its tokens and subscribed fields.                                                     |
-| `POST accounts/:id`                         | `{ extra_quota_usage? , call_limit?, unsubscribe? }`: use up quota, set a call limit, unsubscribe.     |
-| `POST accounts/:id/tokens`                  | `{ age_hours?, expire?, revoke?, logout? }` for every token of the account.                            |
-| `POST accounts/:id/media`, `GET` it         | Post media `{ caption?, media_product_type?, media_type? }`, or list the account's media.              |
-| `POST accounts/:id/messages`                | A person messages the account `{ text?, attachments?, reply_to?, username \| person_id, hours_ago? }`. |
-| `POST accounts/:id/messages/:mid/delete`    | The person unsends that message.                                                                       |
-| `POST accounts/:id/messages/:mid/reactions` | The person reacts `{ action?, reaction?, emoji? }`.                                                    |
-| `POST people`                               | Create a person `{ username, name? }`.                                                                 |
-| `POST media/:id/comments`, `GET` it         | Someone comments `{ text, username \| person_id \| as_owner, parent_id? }`, or list the comments.      |
-| `GET comments/:id`                          | The comment's state and history.                                                                       |
-| `POST comments/:id/edit`, `.../delete`      | The author edits `{ text }` or deletes the comment.                                                    |
-| `POST comments/:id/age`                     | Backdate the comment `{ hours }`.                                                                      |
-| `POST login/next`                           | How the next login answers `{ account_id, grant? }` or `{ deny: true }`.                               |
-| `GET containers`, `GET containers/:id`      | Publishing containers.                                                                                 |
-| `POST containers/:id`                       | Force a container's `{ status_code }`.                                                                 |
-| `GET webhook`, `POST webhook/verify`        | The callback and its deliveries, or run Meta's verification handshake.                                 |
-| `GET messages`                              | Messages and private replies the app sent.                                                             |
-| `POST faults`, `DELETE faults`              | Fail the next matching calls `{ method?, path?, status?, code?, subcode?, message?, times?, apply? }`. |
-| `GET calls`                                 | Every call received, and the Graph calls this server does not model.                                   |
+| Route                                       | Effect                                                                                                       |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `POST accounts`                             | Create an account `{ username, name?, account_type? }`.                                                      |
+| `GET accounts/:id`                          | The account with its tokens and subscribed fields.                                                           |
+| `POST accounts/:id`                         | `{ extra_quota_usage? , call_limit?, unsubscribe? }`: use up quota, set a call limit, unsubscribe.           |
+| `POST accounts/:id/tokens`                  | `{ age_hours?, expire?, revoke?, logout? }` for every token of the account.                                  |
+| `POST accounts/:id/media`, `GET` it         | Post media `{ caption?, media_product_type?, media_type? }`, or list the account's media.                    |
+| `POST accounts/:id/messages`                | A person messages the account `{ text?, attachments?, reply_to?, username \| person_id, hours_ago? }`.       |
+| `POST accounts/:id/messages/:mid/delete`    | The person unsends that message.                                                                             |
+| `POST accounts/:id/messages/:mid/reactions` | The person reacts `{ action?, reaction?, emoji? }`.                                                          |
+| `POST people`                               | Create a person `{ username, name?, is_user_follow_business?, is_business_follow_user? }`.                   |
+| `POST people/:id`                           | Change `{ is_user_follow_business?, is_business_follow_user? }`.                                             |
+| `POST accounts/:id/outgoing`                | The owner writes from the app `{ text, person_id \| username }`; returns `{ mid, person_id, webhook }`.      |
+| `POST messages/:mid/redeliver`              | Send that message's or echo's webhook again; returns `{ mid, status, delivered }`, 404 for a mid never sent. |
+| `POST media/:id/comments`, `GET` it         | Someone comments `{ text, username \| person_id \| as_owner, parent_id? }`, or list the comments.            |
+| `GET comments/:id`                          | The comment's state and history.                                                                             |
+| `POST comments/:id/edit`, `.../delete`      | The author edits `{ text }` or deletes the comment.                                                          |
+| `POST comments/:id/age`                     | Backdate the comment `{ hours }`.                                                                            |
+| `POST login/next`                           | How the next login answers `{ account_id, grant? }` or `{ deny: true }`.                                     |
+| `GET containers`, `GET containers/:id`      | Publishing containers.                                                                                       |
+| `POST containers/:id`                       | Force a container's `{ status_code }`.                                                                       |
+| `GET webhook`, `POST webhook/verify`        | The callback and its deliveries, or run Meta's verification handshake.                                       |
+| `GET messages`                              | Messages and private replies the app sent.                                                                   |
+| `POST faults`, `DELETE faults`              | Fail the next matching calls `{ method?, path?, status?, code?, subcode?, message?, times?, apply? }`.       |
+| `GET calls`                                 | Every call received, and the Graph calls this server does not model.                                         |
 
 ## What it models
 
@@ -194,6 +200,12 @@ The test actions above, over HTTP, for tests written in other languages. All rou
   `reply_to`, and an unsent one as `is_deleted`. Every message the app sends comes back under
   `message_echoes` with `is_echo: true`, and reactions under `message_reactions`, each only to
   accounts subscribed to that field. Subscribing to a field Meta does not have fails.
+- **What a DM assistant sees.** The User Profile API returns `is_user_follow_business` and
+  `is_business_follow_user` under the same consent rule as the other fields. The owner writing from
+  the Instagram app reaches the app only as a `message_echoes` echo and opens no reply window. An
+  echo of an API send carries the `mid` the send returned. A delivered message or echo can be sent
+  again, with the same body and signature, as Meta's retries are. Unverified: that app-typed
+  messages produce echoes, and that retries are byte-for-byte the same.
 - **Rate limits.** Every call with a valid token answers with Meta's `X-Business-Use-Case-Usage`
   header for its account. With `setCallLimit`, calls over the limit in 24 hours fail with code 80002
   and the header's `estimated_time_to_regain_access`. Private replies are limited to 750 an hour and
@@ -218,6 +230,8 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 
 ## Changes
 
+- **0.3.0**: follow flags on people, the owner writing from the app (`POST accounts/:id/outgoing`),
+  and redelivery of message and echo webhooks.
 - **0.2.0**: messaging webhooks for attachments, replies, unsent messages, echoes and reactions;
   subscribed fields checked against Meta's list; the usage header, call limits and Meta's messaging
   rate limits; injected faults take a subcode; carousels; mentions; a command-line section and the

@@ -83,11 +83,43 @@ export interface TestServer {
     },
   ): Promise<GraphObject>;
   getMedia(accountId: string): Promise<GraphObject[]>;
-  /** Someone who can comment or message. Their id is an Instagram-scoped id (IGSID). */
+  /**
+   * Someone who can comment or message. Their id is an Instagram-scoped id
+   * (IGSID). The follow flags default to false and show in the User Profile
+   * API once the person has messaged the account.
+   */
   createPerson(fields: {
     username: string;
     name?: string;
-  }): Promise<{ id: string; username: string; name: string | null }>;
+    is_user_follow_business?: boolean;
+    is_business_follow_user?: boolean;
+  }): Promise<{
+    id: string;
+    username: string;
+    name: string | null;
+    is_user_follow_business: boolean;
+    is_business_follow_user: boolean;
+  }>;
+  /** Change whether the person follows the account, or the account them. */
+  updatePerson(
+    personId: string,
+    fields: {
+      is_user_follow_business?: boolean;
+      is_business_follow_user?: boolean;
+    },
+  ): Promise<unknown>;
+  /**
+   * The owner writes to a person from the Instagram app: only a
+   * message_echoes webhook, and no 24-hour window for the app.
+   */
+  sendAsOwner(
+    accountId: string,
+    fields: { text: string; person_id?: string; username?: string },
+  ): Promise<{ mid: string; person_id: string; webhook: WebhookDelivery }>;
+  /** Send a message's or echo's webhook again, with the same body and signature. */
+  redeliverMessage(
+    mid: string,
+  ): Promise<{ mid: string; status: number; delivered: boolean }>;
   /**
    * The person messages the account (a new person when only username is given),
    * opening the 24-hour window for the app to reply. hours_ago backdates it.

@@ -1349,3 +1349,139 @@ describe("mentions", () => {
     expect(read.status).toBe(400);
   });
 });
+
+describe("what a DM assistant needs", () => {
+  async function messaging() {
+    const callback = await startCallback();
+    const context = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: callback.verifyToken },
+    });
+    const shop = await context.server.createAccount({ username: "shop" });
+    const token = (await context.login(shop.id)).long.access_token;
+    await context.graph("POST", "me/subscribed_apps", {
+      token,
+      form: { subscribed_fields: "messages,message_echoes" },
+    });
+    const send = (personId, text = "hi") =>
+      context.graph("POST", "me/messages", {
+        token,
+        form: {
+          recipient: JSON.stringify({ id: personId }),
+          message: JSON.stringify({ text }),
+        },
+      });
+    const events = () =>
+      callback.deliveries
+        .flatMap((delivery) => delivery.body.entry)
+        .flatMap((entry) => entry.messaging ?? []);
+    return { ...context, callback, shop, token, send, events };
+  }
+
+  it("reports who follows whom, only once the person has messaged the account", async () => {
+    const { server, graph, shop, token } = await messaging();
+    const person = await server.createPerson({
+      username: "fan",
+      is_user_follow_business: true,
+    });
+    const profile = () =>
+      graph("GET", person.id, {
+        token,
+        query: { fields: "is_user_follow_business,is_business_follow_user" },
+      });
+
+    expect((await profile()).status).toBe(400);
+    await server.sendMessageToAccount(shop.id, {
+      person_id: person.id,
+      text: "hi",
+    });
+    expect((await profile()).body).toMatchObject({
+      is_user_follow_business: true,
+      is_business_follow_user: false,
+    });
+    await server.updatePerson(person.id, { is_business_follow_user: true });
+    expect((await profile()).body.is_business_follow_user).toBe(true);
+  });
+
+  it("sends only an echo when the owner writes from the app, and opens no reply window", async () => {
+    const { server, shop, send, events } = await messaging();
+    const person = await server.createPerson({ username: "customer" });
+
+    const written = await server.sendAsOwner(shop.id, {
+      person_id: person.id,
+      text: "I'll take it from here",
+    });
+
+    expect(written.webhook).toMatchObject({
+      field: "message_echoes",
+      delivered: true,
+    });
+    expect(events()).toEqual([
+      expect.objectContaining({
+        sender: { id: shop.user_id },
+        recipient: { id: person.id },
+        message: {
+          mid: written.mid,
+          text: "I'll take it from here",
+          is_echo: true,
+        },
+      }),
+    ]);
+    expect(await server.getMessages()).toEqual([]);
+    expect((await send(person.id)).body.error).toMatchObject({
+      code: 10,
+      error_subcode: 2534022,
+    });
+  });
+
+  it("redelivers a message and an echo with the same body and signature", async () => {
+    const { server, shop, send, callback } = await messaging();
+    const incoming = await server.sendMessageToAccount(shop.id, {
+      username: "customer",
+      text: "hello",
+    });
+    const sent = await send(incoming.person_id, "Hi!");
+    await expect.poll(() => callback.deliveries.length).toBe(2);
+    const [inboundDelivery, echoDelivery] = callback.deliveries;
+
+    await server.redeliverMessage(incoming.mid);
+    await server.redeliverMessage(sent.body.message_id);
+
+    expect(callback.deliveries).toHaveLength(4);
+    for (const [original, again] of [
+      [inboundDelivery, callback.deliveries[2]],
+      [echoDelivery, callback.deliveries[3]],
+    ]) {
+      expect(again.raw.equals(original.raw)).toBe(true);
+      expect(again.headers["x-hub-signature-256"]).toBe(
+        original.headers["x-hub-signature-256"],
+      );
+    }
+    const unknown = await fetch(
+      new URL("/_fake/messages/unknown-mid/redeliver", server.origin),
+      { method: "POST" },
+    );
+    expect(unknown.status).toBe(404);
+  });
+
+  it("keeps failing sends after a revoke, and on an injected code 4", async () => {
+    const { server, shop, send } = await messaging();
+    const incoming = await server.sendMessageToAccount(shop.id, {
+      username: "customer",
+      text: "hi",
+    });
+    await server.addFault({
+      method: "POST",
+      path: "/messages$",
+      status: 400,
+      code: 4,
+      message: "Application request limit reached",
+    });
+    expect((await send(incoming.person_id)).body.error).toMatchObject({
+      code: 4,
+    });
+    await server.changeTokens(shop.id, { revoke: true });
+    expect((await send(incoming.person_id)).body.error).toMatchObject({
+      code: 190,
+    });
+  });
+});

@@ -339,6 +339,8 @@ export async function startTestServer({
   // person's profile.
   const lastIncoming = new Map();
   const incoming = [];
+  // The exact webhook body of each message and echo delivered, by mid.
+  const sentMessaging = new Map();
   const calls = [];
   const deliveries = [];
   const unimplemented = new Set();
@@ -402,14 +404,47 @@ export async function startTestServer({
     return account;
   }
 
-  function createPerson({ username, name = null }) {
+  function createPerson({
+    username,
+    name = null,
+    is_user_follow_business: followsAccount = false,
+    is_business_follow_user: followedByAccount = false,
+  }) {
     const handle = String(username ?? "").replace(/^@/, "");
     if (!/^[A-Za-z0-9._]{1,30}$/.test(handle)) {
       throw new ControlError(400, "An Instagram username is required");
     }
-    const person = { id: nextId("1"), username: handle, name: name ?? null };
+    const person = {
+      id: nextId("1"),
+      username: handle,
+      name: name ?? null,
+      ...followFlags({
+        is_user_follow_business: followsAccount,
+        is_business_follow_user: followedByAccount,
+      }),
+    };
     people.set(person.id, person);
     return person;
+  }
+
+  /**
+   * Whether the person follows the account and the account follows them, as
+   * the User Profile API reports them.
+   * https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/messaging-api/user-profile
+   */
+  function followFlags(body, current = {}) {
+    const out = {};
+    for (const field of [
+      "is_user_follow_business",
+      "is_business_follow_user",
+    ]) {
+      const value = body[field] ?? current[field] ?? false;
+      if (typeof value !== "boolean") {
+        throw new ControlError(400, `${field} must be true or false`);
+      }
+      out[field] = value;
+    }
+    return out;
   }
 
   function createMedia(account, fields) {
@@ -917,6 +952,14 @@ export async function startTestServer({
       const body = Buffer.from(
         metaJson({ object: "instagram", entry: [entry] }),
       );
+      // A message's or echo's first delivery, kept for redelivery.
+      if (
+        identity.messageId &&
+        (field === "messages" || field === "message_echoes") &&
+        !sentMessaging.has(identity.messageId)
+      ) {
+        sentMessaging.set(identity.messageId, { body });
+      }
       for (const waitMs of [0, 0, 2_000, 5_000]) {
         if (stopped) break;
         if (waitMs) await pause(waitMs);
@@ -1470,8 +1513,8 @@ export async function startTestServer({
           username: node.username,
           profile_pic: `${origin}/_fake/files/avatar-${node.id}`,
           follower_count: node.followers ?? 0,
-          is_user_follow_business: false,
-          is_business_follow_user: false,
+          is_user_follow_business: node.is_user_follow_business,
+          is_business_follow_user: node.is_business_follow_user,
           is_verified_user: false,
         },
         fields ?? asFields(["name", "username"]),
@@ -2115,6 +2158,72 @@ export async function startTestServer({
     if (resource === "people" && method === "POST" && !id) {
       return createPerson(body);
     }
+    if (resource === "people" && id && !sub && method === "POST") {
+      const person = people.get(String(id));
+      if (!person) throw new ControlError(404, `No fake person ${id}`);
+      Object.assign(person, followFlags(body, person));
+      return { ...person };
+    }
+    if (
+      resource === "accounts" &&
+      id &&
+      sub === "outgoing" &&
+      method === "POST"
+    ) {
+      // The owner writes to a person from the Instagram app, not through the
+      // API: Meta sends only the echo (message_echoes, is_echo), and the
+      // person's 24-hour window is not opened by it; the window opens on the
+      // person's own messages.
+      // https://developers.facebook.com/docs/instagram-platform/webhooks/
+      // https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/messaging-api
+      // UNVERIFIED: Meta documents message_echoes for messages the business
+      // sends, but not explicitly that messages typed in the Instagram app
+      // produce them.
+      const account = requireAccount(id);
+      const person =
+        body.person_id != null
+          ? people.get(String(body.person_id))
+          : createPerson({ username: body.username });
+      if (!person)
+        throw new ControlError(404, `No fake person ${body.person_id}`);
+      const text = String(body.text ?? "");
+      if (!text) throw new ControlError(400, "A message needs text");
+      const mid = `aWdf${randomBytes(12).toString("base64url")}`;
+      const webhookResult = await emitMessaging(
+        account,
+        "message_echoes",
+        {
+          sender: { id: account.id },
+          recipient: { id: person.id },
+          message: { mid, text, is_echo: true },
+        },
+        { messageId: mid },
+      );
+      return { mid, person_id: person.id, webhook: webhookResult };
+    }
+    if (
+      resource === "messages" &&
+      id &&
+      sub === "redeliver" &&
+      method === "POST"
+    ) {
+      // Meta retries a failed webhook delivery; the same body gives the same
+      // X-Hub-Signature-256, since the signature is the HMAC of the body.
+      // https://developers.facebook.com/docs/graph-api/webhooks/getting-started
+      // UNVERIFIED: that a retry's body is byte-for-byte the first one's.
+      const mid = decodeURIComponent(id);
+      const sent = sentMessaging.get(mid);
+      if (!sent)
+        throw new ControlError(
+          404,
+          `No message ${mid} was sent to the webhook`,
+        );
+      if (!webhook?.callbackUrl) {
+        throw new ControlError(409, "No webhook callback is configured");
+      }
+      const status = await post(sent.body);
+      return { mid, status, delivered: status >= 200 && status < 300 };
+    }
     if (
       resource === "accounts" &&
       id &&
@@ -2708,6 +2817,12 @@ export async function startTestServer({
     getMessages: () => act("GET", "messages"),
     sendMessageToAccount: (accountId, fields) =>
       act("POST", `accounts/${accountId}/messages`, fields),
+    updatePerson: (personId, fields) =>
+      act("POST", `people/${personId}`, fields),
+    sendAsOwner: (accountId, fields) =>
+      act("POST", `accounts/${accountId}/outgoing`, fields),
+    redeliverMessage: (mid) =>
+      act("POST", `messages/${encodeURIComponent(mid)}/redeliver`),
     deleteMessage: (accountId, mid) =>
       act("POST", `accounts/${accountId}/messages/${mid}/delete`),
     reactToMessage: (accountId, mid, reaction = {}) =>
