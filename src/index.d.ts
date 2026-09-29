@@ -49,9 +49,17 @@ export interface CommentState extends GraphObject {
 }
 
 export interface WebhookDelivery {
-  field: "comments" | "messages";
+  /** Pass to redeliverWebhook to send this delivery again. */
+  id: number;
+  field:
+    | "comments"
+    | "mentions"
+    | "messages"
+    | "message_echoes"
+    | "message_reactions";
   commentId?: string;
   messageId?: string;
+  mediaId?: string;
   accountId: string;
   attempts: Array<{ at: string; status?: number; error?: string }>;
   delivered?: boolean;
@@ -116,6 +124,10 @@ export interface TestServer {
     accountId: string,
     fields: { text: string; person_id?: string; username?: string },
   ): Promise<{ mid: string; person_id: string; webhook: WebhookDelivery }>;
+  /** Send any webhook delivery again, by its id, with the same body and signature. */
+  redeliverWebhook(
+    deliveryId: number,
+  ): Promise<{ id: number; status: number; delivered: boolean }>;
   /** Send a message's or echo's webhook again, with the same body and signature. */
   redeliverMessage(
     mid: string,
@@ -244,6 +256,8 @@ export interface TestServer {
     subcode?: number;
     times?: number;
     apply?: boolean;
+    /** The change is made and the connection closes with no answer. */
+    drop?: boolean;
   }): Promise<unknown>;
   clearFaults(): Promise<unknown>;
   /** Every call the app made, and any Graph calls this server does not model. */

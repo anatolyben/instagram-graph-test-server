@@ -341,6 +341,8 @@ export async function startTestServer({
   const incoming = [];
   // The exact webhook body of each message and echo delivered, by mid.
   const sentMessaging = new Map();
+  // The body of each webhook delivery, by delivery id.
+  const deliveryBodies = new Map();
   const calls = [];
   const deliveries = [];
   const unimplemented = new Set();
@@ -934,7 +936,13 @@ export async function startTestServer({
    * failed delivery (immediately, then a few more times).
    */
   function emit(account, field, entry, identity) {
-    const result = { ...identity, accountId: account.id, field, attempts: [] };
+    const result = {
+      id: deliveries.length + 1,
+      ...identity,
+      accountId: account.id,
+      field,
+      attempts: [],
+    };
     deliveries.push(result);
     if (!account.subscribedFields.has(field)) {
       result.skipped = `account is not subscribed to ${field}`;
@@ -952,6 +960,8 @@ export async function startTestServer({
       const body = Buffer.from(
         metaJson({ object: "instagram", entry: [entry] }),
       );
+      // Every delivery's exact body, so a test can have Meta send it again.
+      deliveryBodies.set(result.id, body);
       // A message's or echo's first delivery, kept for redelivery.
       if (
         identity.messageId &&
@@ -2483,6 +2493,32 @@ export async function startTestServer({
         deliveries,
       };
     }
+    if (
+      resource === "webhook" &&
+      id === "deliveries" &&
+      sub &&
+      parts[3] === "redeliver" &&
+      method === "POST"
+    ) {
+      // Meta retries a delivery with the same body, and so the same
+      // X-Hub-Signature-256.
+      // https://developers.facebook.com/docs/graph-api/webhooks/getting-started
+      const record = deliveries.find((entry) => entry.id === Number(sub));
+      if (!record) throw new ControlError(404, `No webhook delivery ${sub}`);
+      const body = deliveryBodies.get(record.id);
+      if (!body) {
+        throw new ControlError(
+          409,
+          `Delivery ${sub} was never sent: ${record.skipped ?? "not sent yet"}`,
+        );
+      }
+      const status = await post(body);
+      return {
+        id: record.id,
+        status,
+        delivered: status >= 200 && status < 300,
+      };
+    }
     if (resource === "webhook" && id === "verify" && method === "POST") {
       return {
         verified: await verifyWebhook(),
@@ -2520,7 +2556,9 @@ export async function startTestServer({
         code: Number(body.code ?? 2),
         subcode: body.subcode == null ? undefined : Number(body.subcode),
         times: Number(body.times ?? 1),
-        apply: body.apply === true,
+        // drop: the change is made and the connection closes with no answer.
+        apply: body.apply === true || body.drop === true,
+        drop: body.drop === true,
       });
       return { faults: faults.length };
     }
@@ -2741,6 +2779,11 @@ export async function startTestServer({
         token: tokenFrom(request, params),
         url: url.toString(),
       });
+      if (fault?.drop) {
+        // The change was made, and the connection closes with no answer.
+        request.socket.destroy();
+        return;
+      }
       if (fault) {
         // The change was made; the answer to it is lost.
         sendGraphError(
@@ -2821,6 +2864,8 @@ export async function startTestServer({
       act("POST", `people/${personId}`, fields),
     sendAsOwner: (accountId, fields) =>
       act("POST", `accounts/${accountId}/outgoing`, fields),
+    redeliverWebhook: (deliveryId) =>
+      act("POST", `webhook/deliveries/${deliveryId}/redeliver`),
     redeliverMessage: (mid) =>
       act("POST", `messages/${encodeURIComponent(mid)}/redeliver`),
     deleteMessage: (accountId, mid) =>

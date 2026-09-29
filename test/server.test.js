@@ -1485,3 +1485,243 @@ describe("what a DM assistant needs", () => {
     });
   });
 });
+
+describe("redelivering any webhook", () => {
+  it("sends a comment's delivery again with the same body and signature", async () => {
+    const callback = await startCallback();
+    const { server, graph, login } = await setup({
+      webhook: { callbackUrl: callback.url, verifyToken: callback.verifyToken },
+    });
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    await graph("POST", "me/subscribed_apps", {
+      token,
+      form: { subscribed_fields: "comments" },
+    });
+    const post = await server.postMedia(shop.id);
+    const comment = await server.comment(post.id, {
+      username: "fan",
+      text: "Nice",
+    });
+
+    const again = await server.redeliverWebhook(comment.webhook.id);
+
+    expect(again).toEqual({
+      id: comment.webhook.id,
+      status: 200,
+      delivered: true,
+    });
+    expect(callback.deliveries).toHaveLength(2);
+    const [first, second] = callback.deliveries;
+    expect(second.raw.equals(first.raw)).toBe(true);
+    expect(second.headers["x-hub-signature-256"]).toBe(
+      first.headers["x-hub-signature-256"],
+    );
+  });
+
+  it("answers 404 for an unknown delivery and 409 for one never sent", async () => {
+    const { server } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const post = await server.postMedia(shop.id);
+    const comment = await server.comment(post.id, {
+      username: "fan",
+      text: "Nice",
+    });
+    const redeliver = (id) =>
+      fetch(
+        new URL(`/_fake/webhook/deliveries/${id}/redeliver`, server.origin),
+        {
+          method: "POST",
+        },
+      );
+    expect((await redeliver(999)).status).toBe(404);
+    expect((await redeliver(comment.webhook.id)).status).toBe(409);
+  });
+});
+
+describe("a dropped connection", () => {
+  it("makes the change and closes the connection without an answer", async () => {
+    const { server, graph, login } = await setup();
+    const shop = await server.createAccount({ username: "shop" });
+    const token = (await login(shop.id)).long.access_token;
+    const post = await server.postMedia(shop.id);
+    const comment = await server.comment(post.id, {
+      username: "spammer",
+      text: "cheap followers",
+    });
+    await server.addFault({
+      method: "POST",
+      path: `/${comment.id}$`,
+      drop: true,
+    });
+
+    await expect(
+      graph("POST", comment.id, { token, query: { hide: "true" } }),
+    ).rejects.toThrow();
+
+    expect((await server.getComment(comment.id)).hidden).toBe(true);
+    expect(
+      (await graph("POST", comment.id, { token, query: { hide: "false" } }))
+        .status,
+    ).toBe(200);
+  });
+});
+
+describe("login rules the app depends on", () => {
+  async function authorize(server, overrides = {}) {
+    const url = new URL("/oauth/authorize", server.origin);
+    url.search = new URLSearchParams({
+      client_id: APP.id,
+      redirect_uri: APP.redirectUris[0],
+      response_type: "code",
+      scope: SCOPES.join(","),
+      state: "csrf-123",
+      ...overrides,
+    });
+    return fetch(url, { redirect: "manual" });
+  }
+  function exchange(server, fields) {
+    return fetch(new URL("/oauth/access_token", server.origin), {
+      method: "POST",
+      body: new URLSearchParams({
+        client_id: APP.id,
+        client_secret: APP.secret,
+        grant_type: "authorization_code",
+        redirect_uri: APP.redirectUris[0],
+        ...fields,
+      }),
+    });
+  }
+
+  it("returns the state, and refuses a redirect_uri the app did not register", async () => {
+    const { server } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    await server.setNextLogin({ account_id: account.id });
+    const back = new URL((await authorize(server)).headers.get("location"));
+    expect(back.searchParams.get("state")).toBe("csrf-123");
+
+    await server.setNextLogin({ account_id: account.id });
+    const foreign = await authorize(server, {
+      redirect_uri: "https://attacker.example/cb",
+    });
+    expect(foreign.status).toBe(400);
+    expect(foreign.headers.get("location")).toBeNull();
+  });
+
+  it("exchanges a code once, only with the app secret and the same redirect_uri", async () => {
+    const { server } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const codeFor = async () => {
+      await server.setNextLogin({ account_id: account.id });
+      return new URL(
+        (await authorize(server)).headers.get("location"),
+      ).searchParams.get("code");
+    };
+
+    const wrongSecret = await exchange(server, {
+      code: await codeFor(),
+      client_secret: "wrong",
+    });
+    expect(wrongSecret.status).toBe(400);
+
+    const otherRedirect = await exchange(server, {
+      code: await codeFor(),
+      redirect_uri: "http://localhost:4000/elsewhere",
+    });
+    expect(otherRedirect.status).toBe(400);
+
+    const code = await codeFor();
+    expect((await exchange(server, { code })).status).toBe(200);
+    expect((await exchange(server, { code })).status).toBe(400);
+  });
+
+  it("answers an expired token with subcode 463", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+    await server.changeTokens(account.id, { expire: true });
+    expect((await graph("GET", "me", { token })).body.error).toMatchObject({
+      code: 190,
+      error_subcode: 463,
+    });
+  });
+});
+
+describe("comment rules the app depends on", () => {
+  it("returns at most 50 comments a page, whatever limit is asked", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+    const post = await server.postMedia(account.id);
+    for (let index = 0; index < 55; index += 1) {
+      await server.comment(post.id, { username: "fan", text: `c${index}` });
+    }
+    const page = await graph("GET", `${post.id}/comments`, {
+      token,
+      query: { limit: "100" },
+    });
+    expect(page.body.data).toHaveLength(50);
+    expect(page.body.paging.cursors.after).toEqual(expect.any(String));
+  });
+
+  it("deletes a comment's replies with it", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+    const post = await server.postMedia(account.id);
+    const comment = await server.comment(post.id, { username: "a", text: "q" });
+    const reply = await server.comment(post.id, {
+      username: "b",
+      text: "r",
+      parent_id: comment.id,
+    });
+    await graph("DELETE", comment.id, { token });
+    expect((await server.getComment(reply.id)).deleted).toBe(true);
+  });
+});
+
+describe("webhook retries", () => {
+  it("retries a delivery the callback failed, until it answers 200", async () => {
+    let calls = 0;
+    const callback = http.createServer((request, response) => {
+      const url = new URL(request.url, "http://localhost");
+      if (request.method === "GET") {
+        response.writeHead(200).end(url.searchParams.get("hub.challenge"));
+        return;
+      }
+      calls += 1;
+      request.resume();
+      request.on("end", () =>
+        response.writeHead(calls === 1 ? 500 : 200).end(),
+      );
+    });
+    await new Promise((resolve) => callback.listen(0, "127.0.0.1", resolve));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          callback.close(resolve);
+          callback.closeAllConnections();
+        }),
+    );
+    const { server, graph, login } = await setup({
+      webhook: {
+        callbackUrl: `http://127.0.0.1:${callback.address().port}/hook`,
+        verifyToken: "any",
+      },
+    });
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+    await graph("POST", "me/subscribed_apps", {
+      token,
+      form: { subscribed_fields: "comments" },
+    });
+    const post = await server.postMedia(account.id);
+
+    const comment = await server.comment(post.id, { username: "a", text: "q" });
+
+    expect(comment.webhook.delivered).toBe(true);
+    expect(comment.webhook.attempts.map((attempt) => attempt.status)).toEqual([
+      500, 200,
+    ]);
+  });
+});
