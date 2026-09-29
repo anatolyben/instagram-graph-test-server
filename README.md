@@ -1,7 +1,8 @@
 # instagram-graph-test-server
 
-`instagram-graph-test-server` is a local, in-memory fake of the Instagram Graph API (the Instagram API
-with Instagram Login) for testing apps that moderate comments, reply to people and publish media.
+`instagram-graph-test-server` is a local test server for the Instagram Graph API (the Instagram API
+with Instagram Login), for testing apps that moderate comments, reply to people and publish media. It
+keeps everything in memory.
 
 Point your app's Instagram hosts at it instead of Meta. It answers the way Meta does and keeps the
 state an Instagram integration depends on: professional accounts with their tokens and granted scopes,
@@ -230,7 +231,7 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 ## Unverified
 
 Where Meta's documentation is silent or contradicts itself, this server makes the choice below. A
-test that depends on one of these checks the fake, not Meta; confirm it against Meta once before
+test that depends on one of these checks this server, not Meta; confirm it against Meta once before
 relying on it.
 
 | Behaviour                                                         | What this server does                                                                                                                                                                                                                                 |
@@ -257,6 +258,7 @@ relying on it.
 
 ## Changes
 
+- **0.4.1**: describes the package as a local test server.
 - **0.4.0**: every webhook delivery can be sent again (`redeliverWebhook`), a fault that makes the
   change and drops the connection without an answer (`drop`), an Unverified list with each choice
   this server makes where Meta is silent, and doc links for each rule.
