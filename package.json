@@ -1,6 +1,6 @@
 {
   "name": "instagram-graph-test-server",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "A local test server for the Instagram Graph API (Instagram Login), for testing comment moderation, messaging, mentions and publishing without real accounts",
   "license": "MIT",
   "author": "Anatoly Ben",

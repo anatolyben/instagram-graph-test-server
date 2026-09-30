@@ -56,7 +56,11 @@ export interface WebhookDelivery {
     | "mentions"
     | "messages"
     | "message_echoes"
-    | "message_reactions";
+    | "message_reactions"
+    | "messaging_seen"
+    | "messaging_postbacks"
+    | "messaging_referral"
+    | "message_edit";
   commentId?: string;
   messageId?: string;
   mediaId?: string;
@@ -64,6 +68,115 @@ export interface WebhookDelivery {
   attempts: Array<{ at: string; status?: number; error?: string }>;
   delivered?: boolean;
   skipped?: string;
+  /** Held by holdWebhooks() and not sent yet. */
+  held?: boolean;
+}
+
+/** An attachment a person sends, in Meta's webhook types. */
+export interface IncomingAttachment {
+  type:
+    | "image"
+    | "video"
+    | "audio"
+    | "file"
+    | "share"
+    | "ig_post"
+    | "story_mention"
+    | "ig_reel"
+    | "reel"
+    | "ephemeral";
+  /** Used as given. Without it the file is served here and expires. */
+  url?: string;
+  /** How long the served URL works. Default 24 hours. */
+  expires_in_ms?: number;
+  /** The served URL answers 404 from the start. */
+  unavailable?: boolean;
+  /** ig_post: the shared post's media id. */
+  ig_post_media_id?: string;
+  /** ig_reel and reel: the reel's video id. */
+  reel_video_id?: string;
+  /** ig_post, ig_reel and reel: the title. */
+  title?: string;
+  /** story_mention: the story's id, shown through the Conversations API. */
+  story_id?: string;
+  /** image: the size the Conversations API reports. Default 1080. */
+  width?: number;
+  height?: number;
+}
+
+/** A message seeded into a conversation's history, without any webhook. */
+export interface SeedMessage {
+  /** Default: a generated mid. Unique within the account only. */
+  id?: string;
+  from: "customer" | "business";
+  text?: string;
+  /** Milliseconds or an ISO date. Default: now on the server's clock. */
+  created_time?: number | string;
+  attachments?: IncomingAttachment[];
+  /** The mid of an earlier message in the conversation it answers. */
+  reply_to?: string;
+  reply_to_story?: { url: string; id?: string };
+  reactions?: Array<{
+    by: "customer" | "business";
+    reaction?: string;
+    emoji?: string;
+  }>;
+  is_unsupported?: boolean;
+  /** A business message the person has seen, or a person's message the business has. */
+  seen?: boolean;
+}
+
+/** A conversation as the account's state shows it to a test. */
+export interface ConversationState {
+  id: string;
+  customer_id: string;
+  folder: "requests" | "general";
+  updated_time: string | null;
+  /** Oldest first, unsent ones included. */
+  messages: Array<{
+    id: string;
+    from: "customer" | "business";
+    text: string | null;
+    created_time: string;
+    attachments: Array<{
+      id: string;
+      type: string;
+      url: string | null;
+      expires_at: string | null;
+    }>;
+    reply_to: string | null;
+    reply_to_story: { url: string; id?: string } | null;
+    reactions: Array<{
+      by: "customer" | "business";
+      reaction: string;
+      emoji: string;
+    }>;
+    is_unsupported: boolean;
+    deleted: boolean;
+    edits: number;
+    seen_by_customer: boolean;
+    seen_by_business: boolean;
+  }>;
+}
+
+/** Someone who messages one account, under an id scoped to that account. */
+export interface Customer {
+  id: string;
+  username: string;
+  name: string | null;
+  is_user_follow_business: boolean;
+  is_business_follow_user: boolean;
+  /** An admin, developer or tester of the app. */
+  has_app_role: boolean;
+}
+
+/** The app's standing with Meta. */
+export interface AppAccess {
+  mode: "live" | "development";
+  access_level: "standard" | "advanced";
+  business_verified: boolean;
+  /** The Human Agent feature, approved in App Review. */
+  human_agent: boolean;
 }
 
 /**
@@ -76,6 +189,7 @@ export interface TestServer {
   createAccount(fields: {
     username: string;
     name?: string;
+    /** Professional accounts only. Default BUSINESS. */
     account_type?: "BUSINESS" | "MEDIA_CREATOR";
     followers_count?: number;
   }): Promise<GraphObject>;
@@ -124,9 +238,13 @@ export interface TestServer {
     accountId: string,
     fields: { text: string; person_id?: string; username?: string },
   ): Promise<{ mid: string; person_id: string; webhook: WebhookDelivery }>;
-  /** Send any webhook delivery again, by its id, with the same body and signature. */
+  /**
+   * Send any webhook delivery again, by its id, with the same body and
+   * signature; or unsigned ("missing") or wrongly signed ("invalid").
+   */
   redeliverWebhook(
     deliveryId: number,
+    options?: { signature?: "valid" | "missing" | "invalid" },
   ): Promise<{ id: number; status: number; delivered: boolean }>;
   /** Send a message's or echo's webhook again, with the same body and signature. */
   redeliverMessage(
@@ -141,23 +259,23 @@ export interface TestServer {
     accountId: string,
     fields: {
       text?: string;
-      attachments?: Array<{
-        type:
-          | "image"
-          | "video"
-          | "audio"
-          | "file"
-          | "share"
-          | "story_mention"
-          | "ig_reel";
-        url?: string;
-      }>;
+      attachments?: IncomingAttachment[];
       reply_to?: string;
+      /** A reply to the account's story. */
+      reply_to_story?: { url: string; id?: string };
+      is_unsupported?: boolean;
+      /** A new person scoped to this account. */
       username?: string;
       person_id?: string;
       hours_ago?: number;
     },
-  ): Promise<{ mid: string; person_id: string; webhook: WebhookDelivery }>;
+  ): Promise<{
+    mid: string;
+    person_id: string;
+    conversation_id: string;
+    attachments: Array<{ type: string; url: string | null }>;
+    webhook: WebhookDelivery;
+  }>;
   /** The person unsends their message; the app gets it with is_deleted. */
   deleteMessage(
     accountId: string,
@@ -260,8 +378,133 @@ export interface TestServer {
     drop?: boolean;
   }): Promise<unknown>;
   clearFaults(): Promise<unknown>;
-  /** Every call the app made, and any Graph calls this server does not model. */
-  getCalls(): Promise<{ calls: GraphObject[]; unimplemented: string[] }>;
+  /**
+   * Every Graph call (method, path, parameter names, status) and every
+   * webhook attempt, with no tokens, signatures or message content; and the
+   * Graph calls this server does not model.
+   */
+  getCalls(): Promise<{
+    calls: Array<{
+      method: string;
+      path: string;
+      params: string[];
+      at: string;
+      status?: number | null;
+      dropped?: boolean;
+    }>;
+    unimplemented: string[];
+    webhooks: Array<{
+      delivery_id: number;
+      field: string;
+      account_id: string;
+      at: string;
+      signature: "valid" | "missing" | "invalid";
+      status?: number;
+      error?: string;
+    }>;
+  }>;
+  /** Move the server's clock forward. Returns the new time. */
+  advanceClock(ms: number): Promise<{ now: string }>;
+  getAppAccess(): Promise<AppAccess>;
+  /**
+   * Change the app's mode, access level, Business Verification or Human
+   * Agent feature. Advanced Access and Human Agent need a verified business.
+   */
+  setAppAccess(access: Partial<AppAccess>): Promise<AppAccess>;
+  /** Grant or revoke permissions on every token of the account. */
+  setPermissions(
+    accountId: string,
+    change: { grant?: string[]; revoke?: string[] },
+  ): Promise<unknown>;
+  /** Someone who can message the account, with an id scoped to it. */
+  createCustomer(
+    accountId: string,
+    fields: {
+      username: string;
+      id?: string;
+      name?: string;
+      has_app_role?: boolean;
+      is_user_follow_business?: boolean;
+      is_business_follow_user?: boolean;
+    },
+  ): Promise<Customer>;
+  updateCustomer(
+    accountId: string,
+    customerId: string,
+    fields: {
+      has_app_role?: boolean;
+      is_user_follow_business?: boolean;
+      is_business_follow_user?: boolean;
+    },
+  ): Promise<Customer>;
+  /** A conversation with its history, without webhooks. */
+  seedConversation(
+    accountId: string,
+    fields: {
+      id?: string;
+      customer_id?: string;
+      username?: string;
+      folder?: "requests" | "general";
+      messages?: SeedMessage[];
+    },
+  ): Promise<ConversationState>;
+  addConversationMessages(
+    accountId: string,
+    conversationId: string,
+    messages: SeedMessage[],
+  ): Promise<ConversationState>;
+  getConversation(
+    accountId: string,
+    conversationId: string,
+  ): Promise<ConversationState>;
+  getConversations(accountId: string): Promise<ConversationState[]>;
+  setConversationFolder(
+    accountId: string,
+    conversationId: string,
+    folder: "requests" | "general",
+  ): Promise<ConversationState>;
+  /** The person sees the account's message: messaging_seen. */
+  markSeenByCustomer(
+    accountId: string,
+    mid: string,
+  ): Promise<{ webhook: WebhookDelivery }>;
+  /** The person edits their message: message_edit. */
+  editMessage(
+    accountId: string,
+    mid: string,
+    text: string,
+  ): Promise<{ num_edit: number; webhook: WebhookDelivery }>;
+  /** The person taps an icebreaker or button: messaging_postbacks. */
+  sendPostback(
+    accountId: string,
+    fields: {
+      title: string;
+      payload: string;
+      person_id?: string;
+      username?: string;
+    },
+  ): Promise<{ person_id: string; webhook: WebhookDelivery }>;
+  /** The person opens the conversation from an ig.me link: messaging_referral. */
+  sendReferral(
+    accountId: string,
+    fields: {
+      ref: string;
+      source?: string;
+      person_id?: string;
+      username?: string;
+    },
+  ): Promise<{ person_id: string; webhook: WebhookDelivery }>;
+  /** Hold webhook deliveries until releaseWebhooks(). */
+  holdWebhooks(): Promise<unknown>;
+  /** Send the held deliveries in the order made, in reverse, or by delivery id. */
+  releaseWebhooks(options?: {
+    order?: "sent" | "reverse" | number[];
+  }): Promise<WebhookDelivery[]>;
+  /**
+   * Forget conversations, messages, account-scoped people, attachments and
+   * held webhooks. Accounts, tokens, media, comments and logs stay.
+   */
+  resetMessaging(): Promise<unknown>;
   stop(): Promise<void>;
 }
 

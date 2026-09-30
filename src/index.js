@@ -61,6 +61,7 @@ const WEBHOOK_FIELDS = new Set([
   "messaging_postbacks",
   "messaging_seen",
   "messaging_referral",
+  "message_edit",
   "messaging_optins",
   "messaging_handover",
   "messaging_policy_enforcement",
@@ -68,15 +69,58 @@ const WEBHOOK_FIELDS = new Set([
   "standby",
   "story_insights",
 ]);
-// What a person can send the account, in Meta's attachment types.
+// What a person can send the account, in Meta's attachment types. Meta also
+// lists media, story and ig_story without a payload shape; they are not
+// modelled.
 const INCOMING_ATTACHMENTS = new Set([
   "image",
   "video",
   "audio",
   "file",
   "share",
+  "ig_post",
   "story_mention",
   "ig_reel",
+  "reel",
+  "ephemeral",
+]);
+// Instagram API with Instagram Login serves professional accounts only.
+const PROFESSIONAL_ACCOUNT_TYPES = new Set(["BUSINESS", "MEDIA_CREATOR"]);
+// The Human Agent tag lets a human answer within 7 days of the person's last
+// message.
+const HUMAN_AGENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+// Requests-folder conversations inactive this long are not returned.
+const REQUESTS_INACTIVE_MS = 30 * 24 * 60 * 60 * 1000;
+// Conversations API calls per second per account.
+const CONVERSATION_CALLS_PER_SECOND = 2;
+// Meta returns details only for a conversation's 20 most recent messages.
+const DETAILED_MESSAGES = 20;
+// How long a served attachment URL works: Meta documents that the URLs
+// expire, not when; this server's choice.
+const ATTACHMENT_URL_MS = 24 * 60 * 60 * 1000;
+// The reaction the Send API takes, and the emoji Meta shows for it.
+const BUSINESS_REACTIONS = Object.freeze({ love: "❤️" });
+// Fields the Conversations API returns on a conversation and on a message;
+// anything else fails, since this server cannot say what Meta would answer.
+const CONVERSATION_FIELDS = new Set([
+  "id",
+  "updated_time",
+  "participants",
+  "messages",
+  "is_owner",
+]);
+const MESSAGE_FIELDS = new Set([
+  "id",
+  "created_time",
+  "from",
+  "to",
+  "message",
+  "attachments",
+  "reactions",
+  "shares",
+  "story",
+  "is_unsupported",
+  "reply_to",
 ]);
 // Meta expects a webhook receiver to answer within 5 seconds.
 const WEBHOOK_TIMEOUT_MS = 5_000;
@@ -325,6 +369,11 @@ export async function startTestServer({
     );
   }
   let origin = null;
+  // The server's clock: real time moved forward by advanceClock(), so a test
+  // can cross the messaging windows, token lifetimes and rate-limit windows
+  // without waiting.
+  let clockOffset = 0;
+  const clock = () => Date.now() + clockOffset;
   const accounts = new Map();
   const accountsByScopedId = new Map();
   const people = new Map();
@@ -348,6 +397,22 @@ export async function startTestServer({
   const unimplemented = new Set();
   let faults = [];
   let nextLogin = null;
+  // The app's standing with Meta. The defaults are a published app with
+  // Advanced Access and a verified business, which every earlier version of
+  // this server assumed; the Human Agent feature needs its own review.
+  const appAccess = {
+    mode: "live",
+    access_level: "advanced",
+    business_verified: true,
+    human_agent: false,
+  };
+  // Served attachment files, by asset id.
+  const assets = new Map();
+  // Webhooks held back by holdWebhooks(), to be released in any order.
+  let holding = false;
+  let held = [];
+  // Every attempt to deliver a webhook: no body and no signature.
+  const webhookLog = [];
   let webhook = webhookConfig
     ? { ...webhookConfig, verified: false, verifyError: null }
     : null;
@@ -381,6 +446,12 @@ export async function startTestServer({
     if (!/^[A-Za-z0-9._]{1,30}$/.test(handle)) {
       throw new ControlError(400, "An Instagram username is required");
     }
+    if (!PROFESSIONAL_ACCOUNT_TYPES.has(account_type)) {
+      throw new ControlError(
+        400,
+        "account_type must be BUSINESS or MEDIA_CREATOR: Instagram Login serves professional accounts only",
+      );
+    }
     const account = {
       // The professional account id (IG_ID): webhook entry ids and user_id.
       id: nextId("1784"),
@@ -400,6 +471,15 @@ export async function startTestServer({
       callTimes: [],
       privateReplyTimes: [],
       sendTimes: [],
+      conversationCallTimes: [],
+      // The account's messaging: the people who messaged it, under ids scoped
+      // to this account as Meta scopes them, its conversations, and their
+      // messages. Conversation and message ids are this account's only.
+      inbox: {
+        customers: new Map(),
+        conversations: new Map(),
+        messages: new Map(),
+      },
     };
     accounts.set(account.id, account);
     accountsByScopedId.set(account.appScopedId, account);
@@ -474,7 +554,7 @@ export async function startTestServer({
       media_product_type: productType,
       media_type: mediaType,
       permalink,
-      createdAt: Date.now(),
+      createdAt: clock(),
       deleted: false,
       bytes: fields.bytes ?? null,
       contentType: fields.contentType ?? null,
@@ -593,14 +673,14 @@ export async function startTestServer({
     comment.history.push({
       action,
       by,
-      at: new Date().toISOString(),
+      at: new Date(clock()).toISOString(),
       ...detail,
     });
   }
 
   function issueToken(account, scopes, kind) {
     const token = `IGAA${randomBytes(24).toString("base64url")}`;
-    const now = Date.now();
+    const now = clock();
     tokens.set(token, {
       accountId: account.id,
       scopes: new Set(scopes),
@@ -651,10 +731,10 @@ export async function startTestServer({
         { code: 190, subcode: 460 },
       );
     }
-    if (token.expiresAt <= Date.now()) {
+    if (token.expiresAt <= clock()) {
       throw new GraphError(
         400,
-        `Error validating access token: Session has expired on ${new Date(token.expiresAt).toUTCString()}. The current time is ${new Date().toUTCString()}.`,
+        `Error validating access token: Session has expired on ${new Date(token.expiresAt).toUTCString()}. The current time is ${new Date(clock()).toUTCString()}.`,
         { code: 190, subcode: 463 },
       );
     }
@@ -702,23 +782,48 @@ export async function startTestServer({
     return webhook.verified;
   }
 
-  async function post(body) {
-    const signature = createHmac("sha256", app.secret)
-      .update(body)
-      .digest("hex");
-    const response = await fetch(webhook.callbackUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "facebookexternalua",
-        "X-Hub-Signature": `sha1=${createHmac("sha1", app.secret).update(body).digest("hex")}`,
-        "X-Hub-Signature-256": `sha256=${signature}`,
-      },
-      body,
-      signal: outgoing(WEBHOOK_TIMEOUT_MS),
-    });
-    await response.arrayBuffer().catch(() => null);
-    return response.status;
+  /**
+   * POST a webhook body to the callback, signed with the app secret. A test
+   * can send it unsigned (`missing`) or signed with the wrong secret
+   * (`invalid`) to check that its receiver refuses it. Every attempt goes to
+   * the calls ledger, without the body or the signature.
+   */
+  async function post(body, { signature = "valid", record = null } = {}) {
+    const headers = {
+      "Content-Type": "application/json",
+      "User-Agent": "facebookexternalua",
+    };
+    if (signature !== "missing") {
+      const secret =
+        signature === "invalid" ? `${app.secret}-not-the-secret` : app.secret;
+      headers["X-Hub-Signature"] =
+        `sha1=${createHmac("sha1", secret).update(body).digest("hex")}`;
+      headers["X-Hub-Signature-256"] =
+        `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+    }
+    const attempt = record
+      ? {
+          delivery_id: record.id,
+          field: record.field,
+          account_id: record.accountId,
+          at: new Date(clock()).toISOString(),
+          signature,
+        }
+      : null;
+    try {
+      const response = await fetch(webhook.callbackUrl, {
+        method: "POST",
+        headers,
+        body,
+        signal: outgoing(WEBHOOK_TIMEOUT_MS),
+      });
+      await response.arrayBuffer().catch(() => null);
+      if (attempt) webhookLog.push({ ...attempt, status: response.status });
+      return response.status;
+    } catch (error) {
+      if (attempt) webhookLog.push({ ...attempt, error: error.message });
+      throw error;
+    }
   }
 
   /**
@@ -740,7 +845,7 @@ export async function startTestServer({
       "comments",
       {
         id: account.id,
-        time: Math.floor(Date.now() / 1000),
+        time: Math.floor(clock() / 1000),
         changes: [
           {
             field: "comments",
@@ -789,7 +894,7 @@ export async function startTestServer({
           "mentions",
           {
             id: account.id,
-            time: Math.floor(Date.now() / 1000),
+            time: Math.floor(clock() / 1000),
             changes: [
               {
                 field: "mentions",
@@ -813,7 +918,12 @@ export async function startTestServer({
       ...(message.attachments?.length
         ? { attachments: message.attachments }
         : {}),
-      ...(message.replyTo ? { reply_to: { mid: message.replyTo } } : {}),
+      ...(message.replyTo
+        ? { reply_to: { mid: message.replyTo } }
+        : message.replyToStory
+          ? { reply_to: { story: message.replyToStory } }
+          : {}),
+      ...(message.isUnsupported ? { is_unsupported: true } : {}),
       ...extra,
     };
   }
@@ -822,7 +932,7 @@ export async function startTestServer({
    * One messaging event (a message, an echo, a deletion or a reaction) for an
    * account, as Meta's messaging webhooks send it.
    */
-  function emitMessaging(account, field, event, identity, at = Date.now()) {
+  function emitMessaging(account, field, event, identity, at = clock()) {
     return emit(
       account,
       field,
@@ -833,6 +943,10 @@ export async function startTestServer({
         messaging: [{ ...event, timestamp: at }],
       },
       identity,
+      {
+        personId:
+          event.sender.id === account.id ? event.recipient.id : event.sender.id,
+      },
     );
   }
 
@@ -856,19 +970,744 @@ export async function startTestServer({
    * account, with the person it is with.
    */
   function conversationMessage(account, mid) {
-    const received = incoming.find(
-      (message) => message.accountId === account.id && message.mid === mid,
+    const message = account.inbox.messages.get(String(mid));
+    if (!message) return null;
+    const conversation = account.inbox.conversations.get(
+      message.conversationId,
     );
-    if (received) return { message: received, personId: received.personId };
-    const sent = messages.find(
-      (message) => message.from === account.id && message.message_id === mid,
+    return { message, personId: conversation.personId };
+  }
+
+  // ── The account's inbox ────────────────────────────────────────────────
+  // https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/conversations-api
+  const OPAQUE_ID = /^[A-Za-z0-9_=-]{1,128}$/;
+
+  /**
+   * Someone who messages one account. Meta scopes a person's id (IGSID) to
+   * the professional account they talk to, so the same id on two accounts is
+   * two different people here, as on Meta.
+   */
+  function createCustomer(account, fields) {
+    const handle = String(fields.username ?? "").replace(/^@/, "");
+    if (!/^[A-Za-z0-9._]{1,30}$/.test(handle)) {
+      throw new ControlError(400, "An Instagram username is required");
+    }
+    const id = fields.id != null ? String(fields.id) : nextId("1");
+    if (!OPAQUE_ID.test(id)) {
+      throw new ControlError(400, "A person id is letters, digits, -, _ or =");
+    }
+    if (account.inbox.customers.has(id)) {
+      throw new ControlError(409, `The account already has a person ${id}`);
+    }
+    const hasAppRole = fields.has_app_role ?? false;
+    if (typeof hasAppRole !== "boolean") {
+      throw new ControlError(400, "has_app_role must be true or false");
+    }
+    const person = {
+      id,
+      username: handle,
+      name: fields.name ?? null,
+      ...followFlags(fields),
+      hasAppRole,
+    };
+    account.inbox.customers.set(id, person);
+    return person;
+  }
+
+  function customerView(person) {
+    return {
+      id: person.id,
+      username: person.username,
+      name: person.name ?? null,
+      is_user_follow_business: person.is_user_follow_business,
+      is_business_follow_user: person.is_business_follow_user,
+      has_app_role: person.hasAppRole === true,
+    };
+  }
+
+  /** A person as one account knows them: its own people, then anyone else. */
+  function personFor(account, id) {
+    const key = String(id ?? "");
+    return account.inbox.customers.get(key) ?? people.get(key) ?? null;
+  }
+
+  function requirePerson(account, body) {
+    if (body.person_id == null) {
+      return createCustomer(account, { username: body.username });
+    }
+    const person = personFor(account, body.person_id);
+    if (!person) {
+      throw new ControlError(
+        404,
+        `No person ${body.person_id} for the account`,
+      );
+    }
+    return person;
+  }
+
+  /**
+   * The account's one conversation with a person. A new one starts in the
+   * Requests folder; this server's choice, since Meta documents only that
+   * the app's answer moves it to General.
+   */
+  function conversationWith(account, personId, { id = null, folder } = {}) {
+    for (const conversation of account.inbox.conversations.values()) {
+      if (conversation.personId === personId) {
+        if (id != null && id !== conversation.id) {
+          throw new ControlError(
+            409,
+            `The account already has conversation ${conversation.id} with ${personId}`,
+          );
+        }
+        if (folder) conversation.folder = folder;
+        return conversation;
+      }
+    }
+    const conversationId =
+      id ??
+      Buffer.from(`ig:thread:${account.id}:${nextId("")}`).toString(
+        "base64url",
+      );
+    if (!OPAQUE_ID.test(conversationId)) {
+      throw new ControlError(
+        400,
+        "A conversation id is letters, digits, -, _ or =",
+      );
+    }
+    if (account.inbox.conversations.has(conversationId)) {
+      throw new ControlError(
+        409,
+        `The account already has conversation ${conversationId}`,
+      );
+    }
+    const conversation = {
+      id: conversationId,
+      accountId: account.id,
+      personId,
+      folder: folder ?? "requests",
+    };
+    account.inbox.conversations.set(conversationId, conversation);
+    return conversation;
+  }
+
+  function requireFolder(value) {
+    if (value !== "requests" && value !== "general") {
+      throw new ControlError(400, 'folder must be "requests" or "general"');
+    }
+    return value;
+  }
+
+  /** Ids in order: numerically when both are numbers, else as text. */
+  function compareKeys(left, right) {
+    if (/^\d+$/.test(left) && /^\d+$/.test(right)) {
+      return compareIds(left, right);
+    }
+    return left < right ? -1 : left > right ? 1 : 0;
+  }
+
+  /** Newest first, then the larger id first: one order for every read. */
+  const newestFirst = (left, right) =>
+    right.time - left.time || compareKeys(right.id, left.id);
+
+  function messagesOf(account, conversation, { deleted = false } = {}) {
+    return [...account.inbox.messages.values()]
+      .filter(
+        (message) =>
+          message.conversationId === conversation.id &&
+          (deleted || !message.deleted),
+      )
+      .map((message) => ({ time: message.createdAt, id: message.id, message }))
+      .sort(newestFirst);
+  }
+
+  /** When the conversation's last message was added, or null for none. */
+  function updatedAt(account, conversation) {
+    const [latest] = messagesOf(account, conversation, { deleted: true });
+    return latest ? latest.time : null;
+  }
+
+  /**
+   * Whether the app can see the conversation: it has a message, it is not a
+   * Requests conversation inactive for 30 days, and under Standard Access it
+   * is with someone who has a role on the app.
+   */
+  function conversationVisible(account, conversation) {
+    const updated = updatedAt(account, conversation);
+    if (updated == null) return false;
+    if (
+      conversation.folder === "requests" &&
+      clock() - updated > REQUESTS_INACTIVE_MS
+    ) {
+      return false;
+    }
+    if (
+      appAccess.access_level === "standard" &&
+      !hasAppRole(account, conversation.personId)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  function assetSignature(assetId) {
+    return createHmac("sha256", app.secret)
+      .update(`asset:${assetId}`)
+      .digest("hex")
+      .slice(0, 32);
+  }
+
+  /**
+   * An attachment of a message. Without a `url`, the file is served here at a
+   * CDN-style URL that stops working when it expires or the message is
+   * unsent; an explicit `url` is passed through as given.
+   */
+  function storeAttachment(account, mid, fields) {
+    const type = String(fields?.type ?? "");
+    if (!INCOMING_ATTACHMENTS.has(type)) {
+      throw new ControlError(
+        400,
+        `attachment type must be one of ${[...INCOMING_ATTACHMENTS].join(", ")}`,
+      );
+    }
+    const attachment = {
+      id: nextId(""),
+      type,
+      url: null,
+      title: fields.title != null ? String(fields.title) : null,
+      igPostMediaId:
+        fields.ig_post_media_id != null
+          ? String(fields.ig_post_media_id)
+          : null,
+      reelVideoId:
+        fields.reel_video_id != null ? String(fields.reel_video_id) : null,
+      storyId: fields.story_id != null ? String(fields.story_id) : null,
+      width: fields.width ?? 1080,
+      height: fields.height ?? 1080,
+      expiresAt: null,
+      unavailable: fields.unavailable === true,
+    };
+    // Disappearing media arrives without a URL.
+    if (type === "ephemeral") return attachment;
+    if (fields.url != null) {
+      attachment.url = String(fields.url);
+      return attachment;
+    }
+    const lifetime = fields.expires_in_ms ?? ATTACHMENT_URL_MS;
+    if (!Number.isInteger(lifetime) || lifetime <= 0) {
+      throw new ControlError(
+        400,
+        "expires_in_ms must be a positive whole number",
+      );
+    }
+    const assetId = nextId("");
+    attachment.url = `${origin}/ig_messaging_cdn/?asset_id=${assetId}&signature=${assetSignature(assetId)}`;
+    attachment.expiresAt = clock() + lifetime;
+    assets.set(assetId, { account, mid, attachment });
+    return attachment;
+  }
+
+  /** An attachment as the messages webhook carries it. */
+  function attachmentPayload(attachment) {
+    const { type, url, title } = attachment;
+    if (type === "ephemeral") return { type };
+    if (type === "ig_post") {
+      return {
+        type,
+        payload: {
+          ...(attachment.igPostMediaId
+            ? { ig_post_media_id: attachment.igPostMediaId }
+            : {}),
+          ...(title ? { title } : {}),
+          url,
+        },
+      };
+    }
+    if (type === "ig_reel" || type === "reel") {
+      return {
+        type,
+        payload: {
+          ...(attachment.reelVideoId
+            ? { reel_video_id: attachment.reelVideoId }
+            : {}),
+          ...(title ? { title } : {}),
+          url,
+        },
+      };
+    }
+    return { type, payload: { url } };
+  }
+
+  /**
+   * Add a message to a conversation. A person's message is what opens the
+   * app's reply windows.
+   */
+  function addInboxMessage(account, conversation, fields) {
+    const mid = fields.id ?? `aWdf${randomBytes(12).toString("base64url")}`;
+    if (!OPAQUE_ID.test(mid)) {
+      throw new ControlError(400, "A message id is letters, digits, -, _ or =");
+    }
+    if (account.inbox.messages.has(mid)) {
+      throw new ControlError(409, `The account already has message ${mid}`);
+    }
+    const message = {
+      id: mid,
+      accountId: account.id,
+      conversationId: conversation.id,
+      from: fields.from,
+      text: fields.text || null,
+      createdAt: fields.at,
+      attachments: (fields.attachments ?? []).map((attachment) =>
+        storeAttachment(account, mid, attachment),
+      ),
+      replyTo: fields.replyTo ?? null,
+      replyToStory: fields.replyToStory ?? null,
+      reactions: fields.reactions ?? [],
+      isUnsupported: fields.isUnsupported === true,
+      deleted: false,
+      edits: 0,
+      seenByCustomer: fields.from === "business" && fields.seen === true,
+      seenByBusiness: fields.from === "customer" && fields.seen === true,
+    };
+    account.inbox.messages.set(mid, message);
+    if (message.from === "customer") {
+      const key = `${account.id}:${conversation.personId}`;
+      if (!(lastIncoming.get(key) >= message.createdAt)) {
+        lastIncoming.set(key, message.createdAt);
+      }
+    }
+    return message;
+  }
+
+  function timeFrom(value) {
+    if (value == null) return clock();
+    const ms = typeof value === "number" ? value : Date.parse(String(value));
+    if (!Number.isFinite(ms)) {
+      throw new ControlError(
+        400,
+        "created_time must be milliseconds or an ISO date",
+      );
+    }
+    return ms;
+  }
+
+  /** A message a test seeds into a conversation, without any webhook. */
+  function seedMessage(account, conversation, fields) {
+    if (fields.from !== "customer" && fields.from !== "business") {
+      throw new ControlError(400, 'from must be "customer" or "business"');
+    }
+    const attachments = Array.isArray(fields.attachments)
+      ? fields.attachments
+      : [];
+    if (!fields.text && !attachments.length && fields.is_unsupported !== true) {
+      throw new ControlError(
+        400,
+        "A message needs text, attachments or is_unsupported",
+      );
+    }
+    let replyTo = null;
+    if (fields.reply_to != null) {
+      const original = account.inbox.messages.get(String(fields.reply_to));
+      if (!original || original.conversationId !== conversation.id) {
+        throw new ControlError(
+          404,
+          `No message ${fields.reply_to} in this conversation`,
+        );
+      }
+      replyTo = original.id;
+    }
+    const reactions = (
+      Array.isArray(fields.reactions) ? fields.reactions : []
+    ).map((reaction) => {
+      if (reaction?.by !== "customer" && reaction?.by !== "business") {
+        throw new ControlError(
+          400,
+          'a reaction is by "customer" or "business"',
+        );
+      }
+      return {
+        by: reaction.by,
+        reaction: String(reaction.reaction ?? "love"),
+        emoji: String(reaction.emoji ?? "❤️"),
+      };
+    });
+    return addInboxMessage(account, conversation, {
+      id: fields.id != null ? String(fields.id) : undefined,
+      from: fields.from,
+      text: fields.text != null ? String(fields.text) : null,
+      at: timeFrom(fields.created_time),
+      attachments,
+      replyTo,
+      replyToStory: storyReference(fields.reply_to_story),
+      reactions,
+      isUnsupported: fields.is_unsupported === true,
+      seen: fields.seen === true,
+    });
+  }
+
+  function storyReference(value) {
+    if (value == null) return null;
+    if (typeof value !== "object" || value.url == null) {
+      throw new ControlError(400, "reply_to_story needs { url, id? }");
+    }
+    return {
+      url: String(value.url),
+      ...(value.id != null ? { id: String(value.id) } : {}),
+    };
+  }
+
+  /** A message as the account's state shows it to a test. */
+  function messageState(message) {
+    return {
+      id: message.id,
+      from: message.from,
+      text: message.text,
+      created_time: new Date(message.createdAt).toISOString(),
+      attachments: message.attachments.map((attachment) => ({
+        id: attachment.id,
+        type: attachment.type,
+        url: attachment.url,
+        expires_at:
+          attachment.expiresAt == null
+            ? null
+            : new Date(attachment.expiresAt).toISOString(),
+      })),
+      reply_to: message.replyTo,
+      reply_to_story: message.replyToStory,
+      reactions: message.reactions,
+      is_unsupported: message.isUnsupported,
+      deleted: message.deleted,
+      edits: message.edits,
+      seen_by_customer: message.seenByCustomer,
+      seen_by_business: message.seenByBusiness,
+    };
+  }
+
+  function conversationState(account, conversation) {
+    const updated = updatedAt(account, conversation);
+    return {
+      id: conversation.id,
+      customer_id: conversation.personId,
+      folder: conversation.folder,
+      updated_time: updated == null ? null : new Date(updated).toISOString(),
+      messages: messagesOf(account, conversation, { deleted: true })
+        .reverse()
+        .map((entry) => messageState(entry.message)),
+    };
+  }
+
+  function requireConversation(account, id) {
+    const conversation = account.inbox.conversations.get(String(id));
+    if (!conversation) {
+      throw new ControlError(404, `No conversation ${id} for the account`);
+    }
+    return conversation;
+  }
+
+  function requireInboxMessage(account, mid, from) {
+    const message = account.inbox.messages.get(String(mid));
+    if (!message || (from && message.from !== from)) {
+      throw new ControlError(
+        404,
+        `No message ${mid} ${from === "customer" ? "from a person" : from === "business" ? "from the account" : ""} for the account`.replace(
+          /\s+/g,
+          " ",
+        ),
+      );
+    }
+    return message;
+  }
+
+  // ── The Conversations API ──────────────────────────────────────────────
+  function unknownField(name, nodeType) {
+    return new GraphError(
+      400,
+      `(#100) Tried accessing nonexisting field (${name}) on node type (${nodeType})`,
+      { code: 100 },
     );
-    if (sent) return { message: sent, personId: sent.recipient_id };
-    return null;
+  }
+
+  /** Keep only the requested sub-fields, through `data` lists. */
+  function pick(value, sub) {
+    if (!sub || value == null || typeof value !== "object") return value;
+    if (Array.isArray(value.data)) {
+      return { ...value, data: value.data.map((item) => pick(item, sub)) };
+    }
+    const out = {};
+    for (const { name, sub: inner } of sub) {
+      if (value[name] !== undefined) out[name] = pick(value[name], inner);
+    }
+    return out;
+  }
+
+  function fieldList(fields) {
+    return fields
+      .map(({ name, sub }) => (sub ? `${name}{${fieldList(sub)}}` : name))
+      .join(",");
+  }
+
+  /** The 20 most recent messages, the only ones Meta gives details for. */
+  function detailedIds(account, conversation) {
+    return new Set(
+      messagesOf(account, conversation)
+        .slice(0, DETAILED_MESSAGES)
+        .map((entry) => entry.id),
+    );
+  }
+
+  const messageDeleted = () =>
+    new GraphError(
+      400,
+      "This Message has been deleted by the user or the business.",
+      { code: 9000001 },
+    );
+
+  function messageView(account, message, fields, detailed) {
+    for (const { name } of fields) {
+      if (!MESSAGE_FIELDS.has(name)) throw unknownField(name, "Message");
+    }
+    const conversation = account.inbox.conversations.get(
+      message.conversationId,
+    );
+    const person = personFor(account, conversation.personId);
+    const business = { username: account.username, id: account.id };
+    const customer = { username: person.username, id: person.id };
+    const [from, to] =
+      message.from === "business" ? [business, customer] : [customer, business];
+    const full = { id: message.id, created_time: iso(message.createdAt) };
+    if (detailed) {
+      const files = [];
+      const shares = [];
+      let mention = null;
+      for (const attachment of message.attachments) {
+        const { id, type, url } = attachment;
+        if (type === "image") {
+          files.push({
+            id,
+            image_data: {
+              url,
+              preview_url: url,
+              width: attachment.width,
+              height: attachment.height,
+              max_width: attachment.width,
+              max_height: attachment.height,
+              render_as_sticker: false,
+            },
+          });
+        } else if (type === "video") {
+          files.push({ id, video_data: { url, preview_url: url } });
+        } else if (type === "audio" || type === "file") {
+          files.push({ id, file_url: url });
+        } else if (type === "story_mention") {
+          mention = {
+            link: url,
+            ...(attachment.storyId ? { id: attachment.storyId } : {}),
+          };
+        } else if (type !== "ephemeral") {
+          shares.push({
+            type: type === "share" ? "post" : type,
+            url,
+            ...(attachment.igPostMediaId || attachment.reelVideoId
+              ? { id: attachment.igPostMediaId ?? attachment.reelVideoId }
+              : {}),
+            ...(attachment.title ? { name: attachment.title } : {}),
+          });
+        }
+      }
+      const original = message.replyTo
+        ? account.inbox.messages.get(message.replyTo)
+        : null;
+      Object.assign(full, {
+        from,
+        to: { data: [to] },
+        message: message.text ?? "",
+        attachments: files.length ? { data: files } : undefined,
+        shares: shares.length ? { data: shares } : undefined,
+        story: mention ? { mention } : undefined,
+        reactions: message.reactions.length
+          ? {
+              data: message.reactions.map((reaction) => ({
+                reaction: reaction.emoji,
+                users: [reaction.by === "business" ? business : customer],
+              })),
+            }
+          : undefined,
+        reply_to: original
+          ? { mid: original.id, is_self_reply: original.from === message.from }
+          : undefined,
+        is_unsupported: message.isUnsupported ? true : undefined,
+      });
+    }
+    const out = { id: message.id };
+    for (const { name, sub } of fields) {
+      if (full[name] !== undefined) out[name] = pick(full[name], sub);
+    }
+    return out;
+  }
+
+  /**
+   * One page of a listing in Meta's cursor envelope. Cursors are opaque and
+   * name a position (time and id) in one account's one listing: a cursor
+   * from another account or another listing is refused. Paging is live, not
+   * a snapshot: what moves ahead of a cursor is not repeated, and what moves
+   * from after it to ahead of it is not reached until the listing is read
+   * again. Meta documents neither.
+   */
+  function keysetPage({ account, collection, items, params, url, view }) {
+    const requested = Number(params.limit);
+    const limit = Math.min(
+      Math.max(
+        Number.isFinite(requested) && requested > 0
+          ? Math.floor(requested)
+          : 25,
+        1,
+      ),
+      100,
+    );
+    const cursorOf = (item) =>
+      Buffer.from(
+        JSON.stringify({
+          a: account.id,
+          c: collection,
+          t: item.time,
+          i: item.id,
+        }),
+      ).toString("base64url");
+    const readCursor = (value, which) => {
+      let key = null;
+      try {
+        key = JSON.parse(Buffer.from(String(value), "base64url").toString());
+      } catch {
+        key = null;
+      }
+      if (
+        !key ||
+        key.a !== account.id ||
+        key.c !== collection ||
+        !Number.isFinite(key.t) ||
+        typeof key.i !== "string"
+      ) {
+        throw new GraphError(400, `(#100) The ${which} cursor is invalid`, {
+          code: 100,
+        });
+      }
+      return { time: key.t, id: key.i };
+    };
+    let slice;
+    let more;
+    let earlier;
+    if (params.after != null) {
+      const position = readCursor(params.after, "after");
+      const rest = items.filter((item) => newestFirst(item, position) > 0);
+      slice = rest.slice(0, limit);
+      more = rest.length > limit;
+      earlier = items.length > rest.length;
+    } else if (params.before != null) {
+      const position = readCursor(params.before, "before");
+      const ahead = items.filter((item) => newestFirst(item, position) < 0);
+      slice = ahead.slice(-limit);
+      earlier = ahead.length > limit;
+      more = items.length > ahead.length;
+    } else {
+      slice = items.slice(0, limit);
+      more = items.length > limit;
+      earlier = false;
+    }
+    const out = { data: slice.map(view) };
+    if (!slice.length) return out;
+    out.paging = {
+      cursors: { before: cursorOf(slice[0]), after: cursorOf(slice.at(-1)) },
+    };
+    const link = (key, value) => {
+      const next = new URL(url);
+      next.searchParams.delete("after");
+      next.searchParams.delete("before");
+      next.searchParams.set(key, value);
+      return next.toString();
+    };
+    if (more) out.paging.next = link("after", out.paging.cursors.after);
+    if (earlier)
+      out.paging.previous = link("before", out.paging.cursors.before);
+    return out;
+  }
+
+  function messagesPage(account, conversation, params, url, fields) {
+    const detailed = detailedIds(account, conversation);
+    return keysetPage({
+      account,
+      collection: `messages:${conversation.id}`,
+      items: messagesOf(account, conversation),
+      params,
+      url,
+      view: (entry) =>
+        messageView(account, entry.message, fields, detailed.has(entry.id)),
+    });
+  }
+
+  function conversationView(account, conversation, fields, url) {
+    for (const { name } of fields) {
+      if (!CONVERSATION_FIELDS.has(name)) {
+        throw unknownField(name, "Conversation");
+      }
+    }
+    const out = { id: conversation.id };
+    for (const { name, sub } of fields) {
+      if (name === "updated_time") {
+        out.updated_time = iso(updatedAt(account, conversation));
+      } else if (name === "participants") {
+        const person = personFor(account, conversation.personId);
+        out.participants = pick(
+          {
+            data: [
+              { username: account.username, id: account.id },
+              { username: person.username, id: person.id },
+            ],
+          },
+          sub,
+        );
+      } else if (name === "messages") {
+        // The first page of the conversation's messages edge, with links to
+        // the next pages of that edge.
+        const messageFields = sub ?? asFields(["id", "created_time"]);
+        const version = new URL(url).pathname.match(/^\/v\d+\.\d+/)?.[0] ?? "";
+        const edge = new URL(
+          `${version}/${encodeURIComponent(conversation.id)}/messages`,
+          origin,
+        );
+        const token = new URL(url).searchParams.get("access_token");
+        if (token) edge.searchParams.set("access_token", token);
+        edge.searchParams.set("fields", fieldList(messageFields));
+        out.messages = messagesPage(
+          account,
+          conversation,
+          {},
+          edge.toString(),
+          messageFields,
+        );
+      }
+      // is_owner exists only with Conversation Routing, which is not modelled.
+    }
+    return out;
+  }
+
+  /** Meta allows the Conversations API 2 calls a second per account. */
+  function countConversationCall(account) {
+    if (
+      recent(account.conversationCallTimes, 1000) >=
+      CONVERSATION_CALLS_PER_SECOND
+    ) {
+      throw new GraphError(
+        400,
+        "Calls to this api have exceeded the rate limit.",
+        {
+          code: 613,
+        },
+      );
+    }
+    account.conversationCallTimes.push(clock());
   }
 
   /** Drop times older than a window, and say how many are left. */
-  function recent(times, windowMs, now = Date.now()) {
+  function recent(times, windowMs, now = clock()) {
     while (times.length && times[0] <= now - windowMs) times.shift();
     return times.length;
   }
@@ -879,7 +1718,7 @@ export async function startTestServer({
    * again.
    */
   function usageHeader(account) {
-    const now = Date.now();
+    const now = clock();
     const used = recent(account.callTimes, CALL_WINDOW_MS, now);
     const percent = account.callLimit
       ? Math.min(100, Math.floor((used * 100) / account.callLimit))
@@ -918,7 +1757,7 @@ export async function startTestServer({
         { code: 80002 },
       );
     }
-    account.callTimes.push(Date.now());
+    account.callTimes.push(clock());
   }
 
   /** The account a Graph request's token belongs to, if the token is valid. */
@@ -930,12 +1769,20 @@ export async function startTestServer({
     }
   }
 
+  /** Whether a person has a role on the app (admin, developer or tester). */
+  function hasAppRole(account, personId) {
+    const person =
+      account.inbox.customers.get(personId) ?? people.get(personId);
+    return person?.hasAppRole === true;
+  }
+
   /**
    * Deliver one event for an account, in order. Meta sends only to a verified
-   * callback and only for an account subscribed to the field, and retries a
-   * failed delivery (immediately, then a few more times).
+   * callback, for an account subscribed to the field, from a Live app; under
+   * Standard Access only about people with a role on the app, and no comments.
+   * It retries a failed delivery (immediately, then a few more times).
    */
-  function emit(account, field, entry, identity) {
+  function emit(account, field, entry, identity, { personId } = {}) {
     const result = {
       id: deliveries.length + 1,
       ...identity,
@@ -952,44 +1799,67 @@ export async function startTestServer({
       result.skipped = "no webhook callback is configured";
       return Promise.resolve(result);
     }
+    if (appAccess.mode !== "live") {
+      result.skipped = "the app is not Live";
+      return Promise.resolve(result);
+    }
+    if (appAccess.access_level === "standard") {
+      if (field === "comments" || field === "live_comments") {
+        result.skipped = `Standard Access: ${field} needs Advanced Access`;
+        return Promise.resolve(result);
+      }
+      if (personId !== undefined && !hasAppRole(account, personId)) {
+        result.skipped = "Standard Access: the person has no role on the app";
+        return Promise.resolve(result);
+      }
+    }
+    const body = Buffer.from(metaJson({ object: "instagram", entry: [entry] }));
+    if (holding) {
+      result.held = true;
+      held.push({ result, body, identity });
+      return Promise.resolve(result);
+    }
+    return deliver(result, body, identity);
+  }
+
+  /** Send one delivery after those already queued, retrying a failure. */
+  function deliver(result, body, identity) {
     delivery = delivery.then(async () => {
+      delete result.held;
       if (!webhook.verified && !(await verifyWebhook())) {
         result.skipped = `callback not verified: ${webhook.verifyError}`;
         return;
       }
-      const body = Buffer.from(
-        metaJson({ object: "instagram", entry: [entry] }),
-      );
       // Every delivery's exact body, so a test can have Meta send it again.
       deliveryBodies.set(result.id, body);
       // A message's or echo's first delivery, kept for redelivery.
       if (
         identity.messageId &&
-        (field === "messages" || field === "message_echoes") &&
+        (result.field === "messages" || result.field === "message_echoes") &&
         !sentMessaging.has(identity.messageId)
       ) {
-        sentMessaging.set(identity.messageId, { body });
+        sentMessaging.set(identity.messageId, { body, record: result });
       }
       for (const waitMs of [0, 0, 2_000, 5_000]) {
         if (stopped) break;
         if (waitMs) await pause(waitMs);
         if (stopped) break;
         try {
-          const status = await post(body);
-          result.attempts.push({ at: new Date().toISOString(), status });
+          const status = await post(body, { record: result });
+          result.attempts.push({ at: new Date(clock()).toISOString(), status });
           if (status >= 200 && status < 300) {
             result.delivered = true;
             return;
           }
         } catch (error) {
           result.attempts.push({
-            at: new Date().toISOString(),
+            at: new Date(clock()).toISOString(),
             error: error.message,
           });
         }
       }
       result.delivered = false;
-      log(`webhook delivery of ${field} failed after retries`);
+      log(`webhook delivery of ${result.field} failed after retries`);
     });
     return delivery.then(() => result);
   }
@@ -1040,7 +1910,7 @@ export async function startTestServer({
       parentId: parent?.id ?? null,
       from,
       text: String(text ?? ""),
-      createdAt: Date.now(),
+      createdAt: clock(),
       hidden: false,
       deleted: false,
       history: [],
@@ -1111,7 +1981,7 @@ export async function startTestServer({
     if (container.forced) return;
     if (container.children) {
       // A carousel is ready when every item is, and fails when one does.
-      if (Date.now() - container.createdAt > CONTAINER_LIFETIME_MS) {
+      if (clock() - container.createdAt > CONTAINER_LIFETIME_MS) {
         container.statusCode = "EXPIRED";
         return;
       }
@@ -1128,7 +1998,7 @@ export async function startTestServer({
         container.statusCode = "FINISHED";
       return;
     }
-    if (Date.now() - container.createdAt > CONTAINER_LIFETIME_MS) {
+    if (clock() - container.createdAt > CONTAINER_LIFETIME_MS) {
       container.statusCode = "EXPIRED";
       return;
     }
@@ -1145,7 +2015,7 @@ export async function startTestServer({
   }
 
   function quotaUsage(account) {
-    const since = Date.now() - PUBLISH_QUOTA.quota_duration * 1000;
+    const since = clock() - PUBLISH_QUOTA.quota_duration * 1000;
     return (
       account.publishedAt.filter((at) => at > since).length +
       account.extraQuotaUsage
@@ -1211,7 +2081,7 @@ export async function startTestServer({
         productType === "STORY" || carouselItem ? null : (params.caption ?? ""),
       carouselItem,
       statusCode: "IN_PROGRESS",
-      createdAt: Date.now(),
+      createdAt: clock(),
       polls: 0,
       pollsUntilFinished: mediaType === "VIDEO" ? videoPollsUntilFinished : 0,
       downloaded: false,
@@ -1283,7 +2153,7 @@ export async function startTestServer({
       carouselItem: false,
       children: children.map((child) => child.id),
       statusCode: "IN_PROGRESS",
-      createdAt: Date.now(),
+      createdAt: clock(),
       polls: 0,
       pollsUntilFinished: 0,
       downloaded: true,
@@ -1367,7 +2237,7 @@ export async function startTestServer({
     container.statusCode = "PUBLISHED";
     container.mediaId = item.id;
     // A carousel counts as one post against the quota.
-    account.publishedAt.push(Date.now());
+    account.publishedAt.push(clock());
     void emitMentions({ text: item.caption, mediaId: item.id });
     return { id: item.id };
   }
@@ -1418,6 +2288,20 @@ export async function startTestServer({
     if (accountsByScopedId.has(id)) {
       return { kind: "account", node: accountsByScopedId.get(id) };
     }
+    // The token's own account's inbox: its conversation, message and person
+    // ids mean nothing to another account's token.
+    if (account.inbox.conversations.has(id)) {
+      return {
+        kind: "conversation",
+        node: account.inbox.conversations.get(id),
+      };
+    }
+    if (account.inbox.messages.has(id)) {
+      return { kind: "message", node: account.inbox.messages.get(id) };
+    }
+    if (account.inbox.customers.has(id)) {
+      return { kind: "person", node: account.inbox.customers.get(id) };
+    }
     if (media.has(id) && !media.get(id).deleted) {
       return { kind: "media", node: media.get(id) };
     }
@@ -1435,6 +2319,7 @@ export async function startTestServer({
     if (kind === "account") return node.id;
     if (kind === "media" || kind === "container") return node.owner;
     if (kind === "comment") return media.get(node.mediaId)?.owner;
+    if (kind === "conversation" || kind === "message") return node.accountId;
     return null;
   }
 
@@ -1551,6 +2436,89 @@ export async function startTestServer({
       }
     }
 
+    if (kind === "account" && method === "GET" && edge === "conversations") {
+      requireScope(grant, SCOPES.messages);
+      countConversationCall(node);
+      if ("folder" in params) {
+        throw new GraphError(
+          400,
+          "(#100) The folder parameter is not modelled: Meta documents no values for it on Instagram",
+          { code: 100 },
+        );
+      }
+      if (
+        params.platform != null &&
+        String(params.platform).toLowerCase() !== "instagram"
+      ) {
+        throw new GraphError(
+          400,
+          "(#100) Param platform must be instagram on an Instagram account",
+          { code: 100 },
+        );
+      }
+      const listFields = fields ?? asFields(["id", "updated_time"]);
+      for (const { name } of listFields) {
+        if (!CONVERSATION_FIELDS.has(name)) {
+          throw unknownField(name, "Conversation");
+        }
+      }
+      const items = [...node.inbox.conversations.values()]
+        .filter(
+          (conversation) =>
+            conversationVisible(node, conversation) &&
+            (params.user_id == null ||
+              conversation.personId === String(params.user_id)),
+        )
+        .map((conversation) => ({
+          time: updatedAt(node, conversation),
+          id: conversation.id,
+          conversation,
+        }))
+        .sort(newestFirst);
+      return keysetPage({
+        account: node,
+        collection: "conversations",
+        items,
+        params,
+        url,
+        view: (entry) =>
+          conversationView(node, entry.conversation, listFields, url),
+      });
+    }
+    if (kind === "conversation" || kind === "message") {
+      requireScope(grant, SCOPES.messages);
+      countConversationCall(account);
+      const conversation =
+        kind === "conversation"
+          ? node
+          : account.inbox.conversations.get(node.conversationId);
+      if (!conversationVisible(account, conversation)) {
+        throw missingObject(nodeId);
+      }
+      if (kind === "conversation" && method === "GET" && !edge) {
+        return conversationView(account, node, fields ?? [], url);
+      }
+      if (kind === "conversation" && method === "GET" && edge === "messages") {
+        const messageFields = fields ?? asFields(["id", "created_time"]);
+        for (const { name } of messageFields) {
+          if (!MESSAGE_FIELDS.has(name)) throw unknownField(name, "Message");
+        }
+        return messagesPage(account, node, params, url, messageFields);
+      }
+      if (kind === "message" && method === "GET" && !edge) {
+        // Meta answers a message outside the 20 most recent as deleted.
+        if (node.deleted || !detailedIds(account, conversation).has(node.id)) {
+          throw messageDeleted();
+        }
+        return messageView(
+          account,
+          node,
+          fields ?? asFields(["id", "created_time"]),
+          true,
+        );
+      }
+    }
+
     if (kind === "media" && method === "GET" && edge === "children") {
       return {
         data: (node.children ?? []).map((id) =>
@@ -1656,6 +2624,102 @@ export async function startTestServer({
         });
       };
       const recipient = asObject(params.recipient, "recipient");
+      const noSuchUser = () =>
+        new GraphError(400, "No matching Instagram user", {
+          code: 100,
+          subcode: 2534014,
+        });
+      // Under Standard Access the app may message only people with a role on
+      // it; Meta documents the rule, and this error in Messenger's wording.
+      const requireRole = (person) => {
+        if (
+          appAccess.access_level === "standard" &&
+          !hasAppRole(node, person.id)
+        ) {
+          throw new GraphError(
+            403,
+            "(#200) Permission Error: Cannot message users who are not admins, developers or testers of the app until pages_messaging permission is reviewed and the app is live.",
+            { code: 200 },
+          );
+        }
+      };
+      if (params.sender_action != null) {
+        // Typing indicators, marking seen and reacting: only the recipient
+        // and the action (and a reaction's payload), answered with the
+        // recipient's id, and never echoed.
+        requireScope(grant, SCOPES.messages);
+        const action = String(params.sender_action);
+        const reacting = action === "react" || action === "unreact";
+        if (
+          !["typing_on", "typing_off", "mark_seen"].includes(action) &&
+          !reacting
+        ) {
+          throw new GraphError(
+            400,
+            `(#100) Param sender_action must be one of {typing_on, typing_off, mark_seen, react, unreact}`,
+            { code: 100 },
+          );
+        }
+        const allowed = new Set([
+          "recipient",
+          "sender_action",
+          "access_token",
+          ...(reacting ? ["payload"] : []),
+        ]);
+        if (Object.keys(params).some((key) => !allowed.has(key))) {
+          throw new GraphError(
+            400,
+            "(#100) A sender action request takes only recipient and sender_action",
+            { code: 100 },
+          );
+        }
+        const person = personFor(node, recipient.id);
+        const conversation = person
+          ? [...node.inbox.conversations.values()].find(
+              (entry) => entry.personId === person.id,
+            )
+          : null;
+        if (!conversation) throw noSuchUser();
+        requireRole(person);
+        if (action === "mark_seen") {
+          for (const { message: seen } of messagesOf(node, conversation)) {
+            if (seen.from === "customer") seen.seenByBusiness = true;
+          }
+        }
+        if (reacting) {
+          const payload = asObject(params.payload, "payload");
+          const target = node.inbox.messages.get(
+            String(payload.message_id ?? ""),
+          );
+          if (
+            !target ||
+            target.deleted ||
+            target.conversationId !== conversation.id
+          ) {
+            throw missingObject(payload.message_id);
+          }
+          const reaction = String(payload.reaction ?? "love");
+          if (
+            action === "react" &&
+            !Object.hasOwn(BUSINESS_REACTIONS, reaction)
+          ) {
+            throw new GraphError(400, "(#100) Param reaction must be love", {
+              code: 100,
+            });
+          }
+          target.reactions = target.reactions.filter(
+            (entry) => entry.by !== "business",
+          );
+          if (action === "react") {
+            target.reactions.push({
+              by: "business",
+              reaction,
+              emoji: BUSINESS_REACTIONS[reaction],
+            });
+          }
+        }
+        return { recipient_id: person.id };
+      }
       const message = asObject(params.message, "message");
       const attachments = Array.isArray(message.attachments)
         ? message.attachments
@@ -1680,6 +2744,7 @@ export async function startTestServer({
           subcode: 2534022,
         });
       let recipientId;
+      let conversation = null;
       if (recipient.comment_id != null) {
         // A private reply: one message to the commenter, within 7 days of the
         // comment, under the comments permission.
@@ -1694,7 +2759,7 @@ export async function startTestServer({
         }
         if (
           comment.privateReplied ||
-          Date.now() - comment.createdAt > PRIVATE_REPLY_MS
+          clock() - comment.createdAt > PRIVATE_REPLY_MS
         ) {
           throw outsideWindow();
         }
@@ -1704,25 +2769,47 @@ export async function startTestServer({
         ) {
           throw overLimit();
         }
-        node.privateReplyTimes.push(Date.now());
+        node.privateReplyTimes.push(clock());
         comment.privateReplied = true;
         recipientId = comment.from.id;
+        // The private reply starts a conversation with the commenter.
+        if (personFor(node, recipientId)) {
+          conversation = conversationWith(node, recipientId);
+        }
       } else {
         requireScope(grant, SCOPES.messages);
-        const person = people.get(String(recipient.id ?? ""));
-        if (!person) {
-          throw new GraphError(400, "No matching Instagram user", {
-            code: 100,
-            subcode: 2534014,
-          });
+        const person = personFor(node, recipient.id);
+        if (!person) throw noSuchUser();
+        requireRole(person);
+        // RESPONSE (the default) and UPDATE answer within 24 hours; the only
+        // tag Instagram takes, HUMAN_AGENT, within 7 days, once the app has
+        // the Human Agent feature.
+        const messagingType = String(params.messaging_type ?? "RESPONSE");
+        let windowMs = MESSAGING_WINDOW_MS;
+        if (messagingType === "MESSAGE_TAG") {
+          if (params.tag !== "HUMAN_AGENT") {
+            throw new GraphError(
+              400,
+              "(#100) Only the HUMAN_AGENT tag is available for Instagram Messaging",
+              { code: 100 },
+            );
+          }
+          if (!appAccess.human_agent) throw missingPermission();
+          windowMs = HUMAN_AGENT_WINDOW_MS;
+        } else if (messagingType !== "RESPONSE" && messagingType !== "UPDATE") {
+          throw new GraphError(
+            400,
+            `(#100) messaging_type ${messagingType} is not available for Instagram Messaging`,
+            { code: 100 },
+          );
         }
         const last = lastIncoming.get(`${node.id}:${person.id}`);
-        if (!last || Date.now() - last > MESSAGING_WINDOW_MS)
-          throw outsideWindow();
+        if (!last || clock() - last > windowMs) throw outsideWindow();
+        conversation = conversationWith(node, person.id);
         if (recent(node.sendTimes, 1000) >= SENDS_PER_SECOND) {
           throw overLimit();
         }
-        node.sendTimes.push(Date.now());
+        node.sendTimes.push(clock());
         recipientId = person.id;
       }
       const sent = {
@@ -1732,9 +2819,30 @@ export async function startTestServer({
         recipient,
         text: message.text ?? null,
         attachments,
-        at: new Date().toISOString(),
+        at: new Date(clock()).toISOString(),
       };
       messages.push(sent);
+      if (conversation) {
+        addInboxMessage(node, conversation, {
+          id: sent.message_id,
+          from: "business",
+          text: sent.text,
+          at: clock(),
+          attachments: attachments
+            .filter(
+              (attachment) =>
+                ["image", "video", "audio", "file"].includes(
+                  String(attachment?.type ?? "").toLowerCase(),
+                ) && attachment.payload?.url,
+            )
+            .map((attachment) => ({
+              type: String(attachment.type).toLowerCase(),
+              url: attachment.payload.url,
+            })),
+        });
+        // Only the app's answer moves a conversation to General.
+        conversation.folder = "general";
+      }
       // Meta echoes every message the account sends back to the app, marked
       // is_echo, to accounts subscribed to message_echoes.
       void emitMessaging(
@@ -1892,7 +3000,7 @@ export async function startTestServer({
       scopes: granted,
       clientId: params.client_id,
       redirectUri: params.redirect_uri,
-      expiresAt: Date.now() + 60 * 60 * 1000,
+      expiresAt: clock() + 60 * 60 * 1000,
       used: false,
     });
     target.searchParams.set("code", code);
@@ -1975,7 +3083,7 @@ export async function startTestServer({
         return loginError("Unsupported grant_type");
       }
       const grant = codes.get(String(form.code ?? ""));
-      if (!grant || grant.used || grant.expiresAt <= Date.now()) {
+      if (!grant || grant.used || grant.expiresAt <= clock()) {
         return loginError("Matching code was not found or was already used");
       }
       if (
@@ -2033,7 +3141,7 @@ export async function startTestServer({
       const { token, account } = requireToken(params.access_token, {
         kind: "long",
       });
-      if (Date.now() - token.issuedAt < REFRESH_MIN_AGE_MS) {
+      if (clock() - token.issuedAt < REFRESH_MIN_AGE_MS) {
         throw new GraphError(
           400,
           "(#100) The access token is less than 24 hours old and cannot be refreshed yet",
@@ -2156,7 +3264,7 @@ export async function startTestServer({
             token.issuedAt -= shift;
             token.expiresAt -= shift;
           }
-          if (body.expire === true) token.expiresAt = Date.now() - 1;
+          if (body.expire === true) token.expiresAt = clock() - 1;
           // revoke: the person removed the app (subcode 458);
           // logout: the session ended, e.g. a password change (subcode 460).
           if (body.revoke === true) token.revoked = "app_removed";
@@ -2190,15 +3298,15 @@ export async function startTestServer({
       // sends, but not explicitly that messages typed in the Instagram app
       // produce them.
       const account = requireAccount(id);
-      const person =
-        body.person_id != null
-          ? people.get(String(body.person_id))
-          : createPerson({ username: body.username });
-      if (!person)
-        throw new ControlError(404, `No fake person ${body.person_id}`);
+      const person = requirePerson(account, body);
       const text = String(body.text ?? "");
       if (!text) throw new ControlError(400, "A message needs text");
-      const mid = `aWdf${randomBytes(12).toString("base64url")}`;
+      // The message is in the conversation, and the folder stays as it was.
+      const { id: mid } = addInboxMessage(
+        account,
+        conversationWith(account, person.id),
+        { from: "business", text, at: clock() },
+      );
       const webhookResult = await emitMessaging(
         account,
         "message_echoes",
@@ -2231,7 +3339,7 @@ export async function startTestServer({
       if (!webhook?.callbackUrl) {
         throw new ControlError(409, "No webhook callback is configured");
       }
-      const status = await post(sent.body);
+      const status = await post(sent.body, { record: sent.record });
       return { mid, status, delivered: status >= 200 && status < 300 };
     }
     if (
@@ -2244,34 +3352,14 @@ export async function startTestServer({
       // A person messages the account. hours_ago backdates it, to test the
       // 24-hour reply window.
       const account = requireAccount(id);
-      const person =
-        body.person_id != null
-          ? people.get(String(body.person_id))
-          : createPerson({ username: body.username });
-      if (!person)
-        throw new ControlError(404, `No fake person ${body.person_id}`);
+      const person = requirePerson(account, body);
       const hoursAgo = Number(body.hours_ago ?? 0);
-      const attachments = (
-        Array.isArray(body.attachments) ? body.attachments : []
-      ).map((attachment) => {
-        if (!INCOMING_ATTACHMENTS.has(attachment?.type)) {
-          throw new ControlError(
-            400,
-            `attachment type must be one of ${[...INCOMING_ATTACHMENTS].join(", ")}`,
-          );
-        }
-        return {
-          type: attachment.type,
-          payload: {
-            url: String(
-              attachment.url ??
-                `https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=${nextId("")}`,
-            ),
-          },
-        };
-      });
+      const attachments = Array.isArray(body.attachments)
+        ? body.attachments
+        : [];
       const text = String(body.text ?? "");
-      if (!text && attachments.length === 0) {
+      const replyToStory = storyReference(body.reply_to_story);
+      if (!text && attachments.length === 0 && body.is_unsupported !== true) {
         throw new ControlError(400, "A message needs text or attachments");
       }
       let replyTo = null;
@@ -2285,19 +3373,41 @@ export async function startTestServer({
         }
         replyTo = String(body.reply_to);
       }
+      const conversation = conversationWith(account, person.id);
+      const stored = addInboxMessage(account, conversation, {
+        from: "customer",
+        text,
+        at: clock() - (Number.isFinite(hoursAgo) ? hoursAgo : 0) * 3_600_000,
+        attachments,
+        replyTo,
+        replyToStory,
+        isUnsupported: body.is_unsupported === true,
+      });
       const message = {
-        mid: `aWdf${randomBytes(12).toString("base64url")}`,
+        mid: stored.id,
         personId: person.id,
         accountId: account.id,
         text,
-        attachments,
+        attachments: stored.attachments.map(attachmentPayload),
         replyTo,
-        at: Date.now() - (Number.isFinite(hoursAgo) ? hoursAgo : 0) * 3_600_000,
+        replyToStory,
+        isUnsupported: stored.isUnsupported,
+        at: stored.createdAt,
       };
       incoming.push(message);
+      // The window runs from this message, even when a test backdates it.
       lastIncoming.set(`${account.id}:${person.id}`, message.at);
       const webhookResult = await emitMessage(account, message);
-      return { mid: message.mid, person_id: person.id, webhook: webhookResult };
+      return {
+        mid: message.mid,
+        person_id: person.id,
+        conversation_id: conversation.id,
+        attachments: stored.attachments.map((attachment) => ({
+          type: attachment.type,
+          url: attachment.url,
+        })),
+        webhook: webhookResult,
+      };
     }
     if (
       resource === "accounts" &&
@@ -2309,23 +3419,24 @@ export async function startTestServer({
     ) {
       // The person unsends their message; Meta tells the app it was deleted.
       const account = requireAccount(id);
-      const message = incoming.find(
-        (entry) => entry.accountId === account.id && entry.mid === parts[3],
-      );
-      if (!message) {
-        throw new ControlError(404, `No message ${parts[3]} from a person`);
-      }
+      const message = requireInboxMessage(account, parts[3], "customer");
       message.deleted = true;
+      for (const entry of incoming) {
+        if (entry.accountId === account.id && entry.mid === message.id) {
+          entry.deleted = true;
+        }
+      }
+      const { personId } = conversationMessage(account, message.id);
       return {
         webhook: await emitMessaging(
           account,
           "messages",
           {
-            sender: { id: message.personId },
+            sender: { id: personId },
             recipient: { id: account.id },
-            message: { mid: message.mid, is_deleted: true },
+            message: { mid: message.id, is_deleted: true },
           },
-          { messageId: message.mid },
+          { messageId: message.id },
         ),
       };
     }
@@ -2348,6 +3459,14 @@ export async function startTestServer({
       if (action !== "react" && action !== "unreact") {
         throw new ControlError(400, 'action must be "react" or "unreact"');
       }
+      const reaction = String(body.reaction ?? "love");
+      const emoji = String(body.emoji ?? "❤️");
+      found.message.reactions = found.message.reactions.filter(
+        (entry) => entry.by !== "customer",
+      );
+      if (action === "react") {
+        found.message.reactions.push({ by: "customer", reaction, emoji });
+      }
       return {
         webhook: await emitMessaging(
           account,
@@ -2357,17 +3476,232 @@ export async function startTestServer({
             recipient: { id: account.id },
             reaction:
               action === "react"
-                ? {
-                    mid: parts[3],
-                    action,
-                    reaction: String(body.reaction ?? "love"),
-                    emoji: String(body.emoji ?? "❤️"),
-                  }
-                : { mid: parts[3], action },
+                ? { mid: found.message.id, action, reaction, emoji }
+                : { mid: found.message.id, action },
           },
-          { messageId: parts[3] },
+          { messageId: found.message.id },
         ),
       };
+    }
+    if (
+      resource === "accounts" &&
+      id &&
+      sub === "messages" &&
+      parts[3] &&
+      parts[4] === "seen" &&
+      method === "POST"
+    ) {
+      // The person sees the account's message, and those before it; Meta
+      // sends messaging_seen with that message's id. Instagram has no
+      // delivery events.
+      const account = requireAccount(id);
+      const message = requireInboxMessage(account, parts[3], "business");
+      const conversation = account.inbox.conversations.get(
+        message.conversationId,
+      );
+      for (const { message: earlier } of messagesOf(account, conversation)) {
+        if (
+          earlier.from === "business" &&
+          earlier.createdAt <= message.createdAt
+        ) {
+          earlier.seenByCustomer = true;
+        }
+      }
+      return {
+        webhook: await emitMessaging(
+          account,
+          "messaging_seen",
+          {
+            sender: { id: conversation.personId },
+            recipient: { id: account.id },
+            read: { mid: message.id },
+          },
+          { messageId: message.id },
+        ),
+      };
+    }
+    if (
+      resource === "accounts" &&
+      id &&
+      sub === "messages" &&
+      parts[3] &&
+      parts[4] === "edit" &&
+      method === "POST"
+    ) {
+      // The person edits their message: message_edit with the new text and
+      // how many times it has been edited.
+      const account = requireAccount(id);
+      const message = requireInboxMessage(account, parts[3], "customer");
+      if (message.deleted) {
+        throw new ControlError(409, `Message ${message.id} was unsent`);
+      }
+      const text = String(body.text ?? "");
+      if (!text) throw new ControlError(400, "An edit needs text");
+      message.text = text;
+      message.edits += 1;
+      const { personId } = conversationMessage(account, message.id);
+      return {
+        num_edit: message.edits,
+        webhook: await emitMessaging(
+          account,
+          "message_edit",
+          {
+            sender: { id: personId },
+            recipient: { id: account.id },
+            message_edit: { mid: message.id, text, num_edit: message.edits },
+          },
+          { messageId: message.id },
+        ),
+      };
+    }
+    if (
+      resource === "accounts" &&
+      id &&
+      (sub === "postbacks" || sub === "referrals") &&
+      !parts[3] &&
+      method === "POST"
+    ) {
+      // A person taps an icebreaker or button (postback), or opens the
+      // conversation from an ig.me link (referral).
+      const account = requireAccount(id);
+      const person = requirePerson(account, body);
+      conversationWith(account, person.id);
+      if (sub === "postbacks") {
+        const title = String(body.title ?? "");
+        const payload = String(body.payload ?? "");
+        if (!title || !payload) {
+          throw new ControlError(400, "A postback needs title and payload");
+        }
+        // Tapping an icebreaker or menu item gives the app the person's
+        // consent, and here also opens the reply window.
+        lastIncoming.set(`${account.id}:${person.id}`, clock());
+        const mid = `aWdf${randomBytes(12).toString("base64url")}`;
+        return {
+          person_id: person.id,
+          webhook: await emitMessaging(
+            account,
+            "messaging_postbacks",
+            {
+              sender: { id: person.id },
+              recipient: { id: account.id },
+              postback: { mid, title, payload },
+            },
+            { messageId: mid },
+          ),
+        };
+      }
+      const ref = String(body.ref ?? "");
+      if (!ref) throw new ControlError(400, "A referral needs ref");
+      return {
+        person_id: person.id,
+        webhook: await emitMessaging(
+          account,
+          "messaging_referral",
+          {
+            sender: { id: person.id },
+            recipient: { id: account.id },
+            referral: {
+              ref,
+              source: String(body.source ?? "IGME"),
+              type: "OPEN_THREAD",
+            },
+          },
+          {},
+        ),
+      };
+    }
+    if (resource === "accounts" && id && sub === "customers") {
+      const account = requireAccount(id);
+      if (!parts[3] && method === "POST") {
+        return customerView(createCustomer(account, body));
+      }
+      const person = account.inbox.customers.get(String(parts[3] ?? ""));
+      if (!person) {
+        throw new ControlError(404, `No person ${parts[3]} for the account`);
+      }
+      if (method === "POST") {
+        Object.assign(person, followFlags(body, person));
+        if (body.has_app_role !== undefined) {
+          if (typeof body.has_app_role !== "boolean") {
+            throw new ControlError(400, "has_app_role must be true or false");
+          }
+          person.hasAppRole = body.has_app_role;
+        }
+      }
+      return customerView(person);
+    }
+    if (resource === "accounts" && id && sub === "conversations") {
+      const account = requireAccount(id);
+      if (!parts[3] && method === "POST") {
+        // A conversation with its history, as it stood before the test: no
+        // webhooks.
+        const person =
+          body.customer_id != null
+            ? personFor(account, body.customer_id)
+            : createCustomer(account, { username: body.username });
+        if (!person) {
+          throw new ControlError(
+            404,
+            `No person ${body.customer_id} for the account`,
+          );
+        }
+        const conversation = conversationWith(account, person.id, {
+          id: body.id != null ? String(body.id) : null,
+          folder: body.folder != null ? requireFolder(body.folder) : undefined,
+        });
+        for (const fields of Array.isArray(body.messages)
+          ? body.messages
+          : []) {
+          seedMessage(account, conversation, fields);
+        }
+        return conversationState(account, conversation);
+      }
+      if (!parts[3] && method === "GET") {
+        return [...account.inbox.conversations.values()].map((conversation) =>
+          conversationState(account, conversation),
+        );
+      }
+      const conversation = requireConversation(account, parts[3]);
+      if (!parts[4] && method === "POST") {
+        if (body.folder !== undefined) {
+          conversation.folder = requireFolder(body.folder);
+        }
+        return conversationState(account, conversation);
+      }
+      if (!parts[4] && method === "GET") {
+        return conversationState(account, conversation);
+      }
+      if (parts[4] === "messages" && method === "POST") {
+        for (const fields of Array.isArray(body.messages)
+          ? body.messages
+          : []) {
+          seedMessage(account, conversation, fields);
+        }
+        return conversationState(account, conversation);
+      }
+    }
+    if (
+      resource === "accounts" &&
+      id &&
+      sub === "permissions" &&
+      method === "POST"
+    ) {
+      // Grant or revoke permissions on every token of the account, as the
+      // person changing what the app may do.
+      const account = requireAccount(id);
+      const known = new Set(Object.values(SCOPES));
+      const grant = Array.isArray(body.grant) ? body.grant : [];
+      const revoke = Array.isArray(body.revoke) ? body.revoke : [];
+      const unknown = [...grant, ...revoke].find((scope) => !known.has(scope));
+      if (unknown !== undefined) {
+        throw new ControlError(400, `Unknown permission ${unknown}`);
+      }
+      for (const token of tokens.values()) {
+        if (token.accountId !== account.id) continue;
+        for (const scope of grant) token.scopes.add(scope);
+        for (const scope of revoke) token.scopes.delete(scope);
+      }
+      return { ok: true };
     }
     if (
       resource === "accounts" &&
@@ -2501,20 +3835,28 @@ export async function startTestServer({
       method === "POST"
     ) {
       // Meta retries a delivery with the same body, and so the same
-      // X-Hub-Signature-256.
+      // X-Hub-Signature-256. `signature` sends it unsigned ("missing") or
+      // wrongly signed ("invalid") instead, for testing the receiver.
       // https://developers.facebook.com/docs/graph-api/webhooks/getting-started
-      const record = deliveries.find((entry) => entry.id === Number(sub));
-      if (!record) throw new ControlError(404, `No webhook delivery ${sub}`);
-      const body = deliveryBodies.get(record.id);
-      if (!body) {
+      const found = deliveries.find((entry) => entry.id === Number(sub));
+      if (!found) throw new ControlError(404, `No webhook delivery ${sub}`);
+      const sentBody = deliveryBodies.get(found.id);
+      if (!sentBody) {
         throw new ControlError(
           409,
-          `Delivery ${sub} was never sent: ${record.skipped ?? "not sent yet"}`,
+          `Delivery ${sub} was never sent: ${found.skipped ?? "not sent yet"}`,
         );
       }
-      const status = await post(body);
+      const signature = body.signature ?? "valid";
+      if (!["valid", "missing", "invalid"].includes(signature)) {
+        throw new ControlError(
+          400,
+          'signature must be "valid", "missing" or "invalid"',
+        );
+      }
+      const status = await post(sentBody, { record: found, signature });
       return {
-        id: record.id,
+        id: found.id,
         status,
         delivered: status >= 200 && status < 300,
       };
@@ -2524,6 +3866,113 @@ export async function startTestServer({
         verified: await verifyWebhook(),
         error: webhook?.verifyError ?? null,
       };
+    }
+    if (resource === "clock" && !id) {
+      // Move the server's clock forward: reply windows, token lifetimes, rate
+      // limits, attachment URLs and the Requests folder all follow it.
+      if (method === "POST") {
+        const advance = body.advance_ms ?? 0;
+        if (!Number.isInteger(advance) || advance < 0) {
+          throw new ControlError(
+            400,
+            "advance_ms must be a whole number of milliseconds, 0 or more",
+          );
+        }
+        clockOffset += advance;
+      }
+      return { now: new Date(clock()).toISOString() };
+    }
+    if (resource === "app" && !id) {
+      if (method === "POST") {
+        const next = { ...appAccess };
+        const choose = (key, values) => {
+          if (body[key] === undefined) return;
+          if (!values.includes(body[key])) {
+            throw new ControlError(
+              400,
+              `${key} must be ${values.map((value) => JSON.stringify(value)).join(" or ")}`,
+            );
+          }
+          next[key] = body[key];
+        };
+        choose("mode", ["live", "development"]);
+        choose("access_level", ["standard", "advanced"]);
+        choose("business_verified", [true, false]);
+        choose("human_agent", [true, false]);
+        // Advanced Access and the Human Agent feature both need Business
+        // Verification.
+        if (next.access_level === "advanced" && !next.business_verified) {
+          throw new ControlError(
+            400,
+            "Advanced Access requires Business Verification",
+          );
+        }
+        if (next.human_agent && !next.business_verified) {
+          throw new ControlError(
+            400,
+            "The Human Agent feature requires Business Verification",
+          );
+        }
+        Object.assign(appAccess, next);
+      }
+      return { ...appAccess };
+    }
+    if (resource === "webhook" && id === "hold" && method === "POST") {
+      holding = true;
+      return { holding };
+    }
+    if (resource === "webhook" && id === "release" && method === "POST") {
+      // Send the held deliveries: in the order they were made ("sent"), in
+      // reverse, or in the order of the delivery ids given.
+      const order = body.order ?? "sent";
+      let ordered;
+      if (order === "sent") ordered = held;
+      else if (order === "reverse") ordered = [...held].reverse();
+      else if (Array.isArray(order)) {
+        const byId = new Map(held.map((entry) => [entry.result.id, entry]));
+        if (
+          order.length !== held.length ||
+          !order.every((deliveryId) => byId.has(deliveryId))
+        ) {
+          throw new ControlError(
+            400,
+            `order must list every held delivery once: ${[...byId.keys()].join(", ")}`,
+          );
+        }
+        ordered = order.map((deliveryId) => byId.get(deliveryId));
+      } else {
+        throw new ControlError(
+          400,
+          'order must be "sent", "reverse" or a list of delivery ids',
+        );
+      }
+      held = [];
+      holding = false;
+      return Promise.all(
+        ordered.map((entry) =>
+          deliver(entry.result, entry.body, entry.identity),
+        ),
+      );
+    }
+    if (resource === "messaging" && id === "reset" && method === "POST") {
+      // Forget every conversation, message, person scoped to an account,
+      // attachment and held webhook. Accounts, tokens, media, comments and
+      // the webhook log stay.
+      for (const account of accounts.values()) {
+        account.inbox.customers.clear();
+        account.inbox.conversations.clear();
+        account.inbox.messages.clear();
+        account.conversationCallTimes = [];
+        account.sendTimes = [];
+      }
+      messages.length = 0;
+      incoming.length = 0;
+      lastIncoming.clear();
+      sentMessaging.clear();
+      assets.clear();
+      held = [];
+      holding = false;
+      return { ok: true };
     }
     if (resource === "messages" && method === "GET") return messages;
     if (resource === "faults" && method === "POST") {
@@ -2567,7 +4016,7 @@ export async function startTestServer({
       return { ok: true };
     }
     if (resource === "calls" && method === "GET") {
-      return { calls, unimplemented: [...unimplemented] };
+      return { calls, unimplemented: [...unimplemented], webhooks: webhookLog };
     }
     throw new ControlError(
       404,
@@ -2614,6 +4063,47 @@ export async function startTestServer({
     return fault ?? null;
   }
 
+  /**
+   * A person's attachment at its CDN-style URL: 404 once the message is
+   * unsent or when the test made it unavailable, 403 once the URL expired.
+   * Meta documents that these URLs stop working, not the answers.
+   */
+  function serveAsset(response, params) {
+    const assetId = String(params.get("asset_id") ?? "");
+    const asset = assets.get(assetId);
+    const message = asset?.account.inbox.messages.get(asset.mid);
+    if (
+      !asset ||
+      params.get("signature") !== assetSignature(assetId) ||
+      !message ||
+      message.deleted ||
+      asset.attachment.unavailable
+    ) {
+      response.writeHead(404, { "Content-Type": "text/plain" });
+      response.end("Content not found");
+      return;
+    }
+    if (clock() > asset.attachment.expiresAt) {
+      response.writeHead(403, { "Content-Type": "text/plain" });
+      response.end("URL signature expired");
+      return;
+    }
+    const type = asset.attachment.type;
+    if (type === "image" || type === "story_mention") {
+      serveFile(response, `asset-${assetId}`);
+      return;
+    }
+    response.writeHead(200, {
+      "Content-Type":
+        type === "video" || type.includes("reel")
+          ? "video/mp4"
+          : type === "audio"
+            ? "audio/mp4"
+            : "application/octet-stream",
+    });
+    response.end(Buffer.from(`${type} ${assetId}`));
+  }
+
   function serveFile(response, id) {
     const item = media.get(id);
     if (item?.bytes) {
@@ -2656,6 +4146,13 @@ export async function startTestServer({
         );
         return;
       }
+      if (
+        url.pathname === "/ig_messaging_cdn/" ||
+        url.pathname === "/ig_messaging_cdn"
+      ) {
+        serveAsset(response, url.searchParams);
+        return;
+      }
       if (url.pathname.startsWith("/_fake/")) {
         const parts = url.pathname
           .slice("/_fake/".length)
@@ -2691,11 +4188,16 @@ export async function startTestServer({
       const graphPath = url.pathname.match(
         /^\/(?:(v\d+\.\d+)\/)?([^/]+)(?:\/([^/]+))?\/?$/,
       );
-      calls.push({
+      // The ledger keeps names, never values: no token, no text.
+      const call = {
         method: request.method,
         path: url.pathname,
         params: Object.keys(query).filter((key) => key !== "access_token"),
-        at: new Date().toISOString(),
+        at: new Date(clock()).toISOString(),
+      };
+      calls.push(call);
+      response.on("finish", () => {
+        call.status = response.statusCode;
       });
       const loginPaths = [
         "/oauth/authorize",
@@ -2781,6 +4283,8 @@ export async function startTestServer({
       });
       if (fault?.drop) {
         // The change was made, and the connection closes with no answer.
+        call.status = null;
+        call.dropped = true;
         request.socket.destroy();
         return;
       }
@@ -2864,8 +4368,8 @@ export async function startTestServer({
       act("POST", `people/${personId}`, fields),
     sendAsOwner: (accountId, fields) =>
       act("POST", `accounts/${accountId}/outgoing`, fields),
-    redeliverWebhook: (deliveryId) =>
-      act("POST", `webhook/deliveries/${deliveryId}/redeliver`),
+    redeliverWebhook: (deliveryId, options = {}) =>
+      act("POST", `webhook/deliveries/${deliveryId}/redeliver`, options),
     redeliverMessage: (mid) =>
       act("POST", `messages/${encodeURIComponent(mid)}/redeliver`),
     deleteMessage: (accountId, mid) =>
@@ -2876,6 +4380,58 @@ export async function startTestServer({
       act("POST", `accounts/${accountId}`, { call_limit: limit }),
     ageComment: (commentId, hours) =>
       act("POST", `comments/${commentId}/age`, { hours }),
+    advanceClock: (ms) => act("POST", "clock", { advance_ms: ms }),
+    getAppAccess: () => act("GET", "app"),
+    setAppAccess: (access) => act("POST", "app", access),
+    setPermissions: (accountId, change) =>
+      act("POST", `accounts/${accountId}/permissions`, change),
+    createCustomer: (accountId, fields) =>
+      act("POST", `accounts/${accountId}/customers`, fields),
+    updateCustomer: (accountId, customerId, fields) =>
+      act(
+        "POST",
+        `accounts/${accountId}/customers/${encodeURIComponent(customerId)}`,
+        fields,
+      ),
+    seedConversation: (accountId, fields) =>
+      act("POST", `accounts/${accountId}/conversations`, fields),
+    addConversationMessages: (accountId, conversationId, messages) =>
+      act(
+        "POST",
+        `accounts/${accountId}/conversations/${encodeURIComponent(conversationId)}/messages`,
+        { messages },
+      ),
+    getConversation: (accountId, conversationId) =>
+      act(
+        "GET",
+        `accounts/${accountId}/conversations/${encodeURIComponent(conversationId)}`,
+      ),
+    getConversations: (accountId) =>
+      act("GET", `accounts/${accountId}/conversations`),
+    setConversationFolder: (accountId, conversationId, folder) =>
+      act(
+        "POST",
+        `accounts/${accountId}/conversations/${encodeURIComponent(conversationId)}`,
+        { folder },
+      ),
+    markSeenByCustomer: (accountId, mid) =>
+      act(
+        "POST",
+        `accounts/${accountId}/messages/${encodeURIComponent(mid)}/seen`,
+      ),
+    editMessage: (accountId, mid, text) =>
+      act(
+        "POST",
+        `accounts/${accountId}/messages/${encodeURIComponent(mid)}/edit`,
+        { text },
+      ),
+    sendPostback: (accountId, fields) =>
+      act("POST", `accounts/${accountId}/postbacks`, fields),
+    sendReferral: (accountId, fields) =>
+      act("POST", `accounts/${accountId}/referrals`, fields),
+    holdWebhooks: () => act("POST", "webhook/hold"),
+    releaseWebhooks: (options = {}) => act("POST", "webhook/release", options),
+    resetMessaging: () => act("POST", "messaging/reset"),
     addFault: (fault) => act("POST", "faults", fault),
     clearFaults: () => act("DELETE", "faults"),
     getCalls: () => act("GET", "calls"),
