@@ -4016,7 +4016,18 @@ export async function startTestServer({
       return { ok: true };
     }
     if (resource === "calls" && method === "GET") {
-      return { calls, unimplemented: [...unimplemented], webhooks: webhookLog };
+      if (body.error_code == null) {
+        return { calls, unimplemented: [...unimplemented], webhooks: webhookLog };
+      }
+      const code = Number(body.error_code);
+      if (!Number.isInteger(code)) {
+        throw new ControlError(400, "error_code must be a whole number");
+      }
+      return {
+        calls: calls.filter((call) => call.error?.code === code),
+        unimplemented: [...unimplemented],
+        webhooks: webhookLog,
+      };
     }
     throw new ControlError(
       404,
@@ -4025,7 +4036,13 @@ export async function startTestServer({
   }
 
   // ── HTTP ───────────────────────────────────────────────────────────────
+  // The Graph error each response carried, for the calls ledger.
+  const sentErrors = new WeakMap();
+
   function sendJson(response, status, payload) {
+    if (payload?.error && typeof payload.error === "object") {
+      sentErrors.set(response, payload.error);
+    }
     response.writeHead(status, {
       "Content-Type": "application/json; charset=UTF-8",
     });
@@ -4159,7 +4176,11 @@ export async function startTestServer({
           .split("/")
           .filter(Boolean);
         try {
-          let payload = {};
+          // A GET takes its options from the query string.
+          let payload =
+            request.method === "GET"
+              ? Object.fromEntries(url.searchParams.entries())
+              : {};
           if (body.length) {
             try {
               payload = JSON.parse(body.toString("utf8"));
@@ -4198,6 +4219,15 @@ export async function startTestServer({
       calls.push(call);
       response.on("finish", () => {
         call.status = response.statusCode;
+        // Only the error's fixed values: its message can name the app's input.
+        const error = sentErrors.get(response);
+        if (error) {
+          call.error = {
+            code: error.code,
+            ...(error.error_subcode ? { error_subcode: error.error_subcode } : {}),
+            ...(error.type ? { type: error.type } : {}),
+          };
+        }
       });
       const loginPaths = [
         "/oauth/authorize",
@@ -4434,7 +4464,8 @@ export async function startTestServer({
     resetMessaging: () => act("POST", "messaging/reset"),
     addFault: (fault) => act("POST", "faults", fault),
     clearFaults: () => act("DELETE", "faults"),
-    getCalls: () => act("GET", "calls"),
+    getCalls: ({ errorCode } = {}) =>
+      act("GET", "calls", errorCode == null ? {} : { error_code: errorCode }),
     stop: async () => {
       stopped = true;
       shutdown.abort();

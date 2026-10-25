@@ -439,6 +439,48 @@ describe("messages and faults", () => {
     expect((await graph("GET", "me", { token })).status).toBe(500);
     expect((await graph("GET", "me", { token })).status).toBe(200);
   });
+
+  it("records the code, subcode and type of each Graph error in the calls ledger", async () => {
+    const { server, graph, login } = await setup();
+    const account = await server.createAccount({ username: "shop" });
+    const token = (await login(account.id)).long.access_token;
+    const before = (await server.getCalls()).calls.length;
+
+    await graph("GET", "me", { token, query: { fields: "id" } });
+    await server.changeTokens(account.id, { revoke: true });
+    expect((await graph("GET", "me", { token })).body.error.code).toBe(190);
+
+    const { calls } = await server.getCalls();
+    const [ok, revoked] = calls.slice(before);
+    expect(ok).toEqual({
+      method: "GET",
+      path: "/v25.0/me",
+      params: ["fields"],
+      at: expect.any(String),
+      status: 200,
+    });
+    // The fixed values only: no message or trace id.
+    expect(revoked).toEqual({
+      method: "GET",
+      path: "/v25.0/me",
+      params: [],
+      at: expect.any(String),
+      status: 400,
+      error: { code: 190, error_subcode: 458, type: "OAuthException" },
+    });
+
+    expect((await server.getCalls({ errorCode: 190 })).calls).toEqual([
+      revoked,
+    ]);
+    const overHttp = await fetch(
+      new URL("/_fake/calls?error_code=190", server.origin),
+    );
+    expect((await overHttp.json()).calls).toEqual([revoked]);
+    expect((await server.getCalls({ errorCode: 10 })).calls).toEqual([]);
+    expect(
+      (await fetch(new URL("/_fake/calls?error_code=x", server.origin))).status,
+    ).toBe(400);
+  });
 });
 
 describe("messaging rules", () => {

@@ -381,9 +381,11 @@ export interface TestServer {
   /**
    * Every Graph call (method, path, parameter names, status) and every
    * webhook attempt, with no tokens, signatures or message content; and the
-   * Graph calls this server does not model.
+   * Graph calls this server does not model. A call answered with a Graph
+   * error carries the error's code, subcode and type; with errorCode, only
+   * the calls answered with that code are listed.
    */
-  getCalls(): Promise<{
+  getCalls(options?: { errorCode?: number }): Promise<{
     calls: Array<{
       method: string;
       path: string;
@@ -391,6 +393,7 @@ export interface TestServer {
       at: string;
       status?: number | null;
       dropped?: boolean;
+      error?: { code: number; error_subcode?: number; type?: string };
     }>;
     unimplemented: string[];
     webhooks: Array<{

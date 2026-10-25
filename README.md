@@ -127,7 +127,7 @@ under `${origin}/_fake/` for tests written in other languages.
 | `getContainers()`, `getMedia(accountId)`                                                                                                          | What the app created and published.                                                                                                                                                                                |
 | `addFault({ method, path, status, code, subcode, times, apply, drop })`                                                                           | Fail the next matching Graph calls; with `apply`, the change is made but the answer is still an error; with `drop`, the change is made and the connection closes with no answer.                                   |
 | `getWebhook()`, `verifyWebhook()`                                                                                                                 | The callback, whether it passed verification, and every delivery attempt.                                                                                                                                          |
-| `getCalls()`                                                                                                                                      | Every call the app made, and any Graph calls this server does not model.                                                                                                                                           |
+| `getCalls({ errorCode })`                                                                                                                         | Every call the app made, with the code, subcode and type of any Graph error; with `errorCode`, only those calls.                                                                                                   |
 | `createCustomer`, `seedConversation`, `addConversationMessages`, `getConversation`, `getConversations`, `setConversationFolder`, `updateCustomer` | People and history for an account's inbox: see [Professional inbox](#professional-inbox).                                                                                                                          |
 | `markSeenByCustomer`, `editMessage`, `sendPostback`, `sendReferral`                                                                               | The person sees, edits, taps a button or opens an ig.me link.                                                                                                                                                      |
 | `advanceClock(ms)`, `setAppAccess(...)`, `getAppAccess()`, `setPermissions(...)`                                                                  | Move the server's clock; change the app's standing with Meta; grant or revoke permissions.                                                                                                                         |
@@ -165,7 +165,7 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `GET webhook`, `POST webhook/verify`                             | The callback and its deliveries, or run Meta's verification handshake.                                                          |
 | `GET messages`                                                   | Messages and private replies the app sent.                                                                                      |
 | `POST faults`, `DELETE faults`                                   | Fail the next matching calls `{ method?, path?, status?, code?, subcode?, message?, times?, apply?, drop? }`.                   |
-| `GET calls`                                                      | Every Graph call with its status, every webhook attempt, and the Graph calls this server does not model.                        |
+| `GET calls`                                                      | Graph calls with status and any error's code, subcode, type (`?error_code=`), webhook attempts, unmodelled calls.               |
 | `GET clock`, `POST clock`                                        | The server's time, or move it forward `{ advance_ms }`.                                                                         |
 | `GET app`, `POST app`                                            | The app's standing `{ mode?, access_level?, business_verified?, human_agent? }`.                                                |
 | `POST accounts/:id/permissions`                                  | `{ grant?, revoke? }`: permission names, on every token of the account.                                                         |
@@ -340,7 +340,23 @@ out from the conversation whether it went.
 
 **The calls ledger.** `getCalls()` lists every Graph call (method, path, parameter names and status)
 and every webhook attempt (delivery, field, account, time, status and signature mode). It records no
-tokens, signatures, app secret or message text.
+tokens, signatures, app secret or message text. A call answered with a Graph error also carries the
+error's fixed values, never its message or trace id:
+
+```js
+{
+  method: "POST",
+  path: "/v25.0/17841400000000001/media",
+  params: ["image_url", "caption"],
+  at: "2026-10-25T12:00:00.000Z",
+  status: 400,
+  error: { code: 190, error_subcode: 458, type: "OAuthException" },
+}
+```
+
+`error_subcode` and `type` are left out when the error has none. `getCalls({ errorCode: 190 })`, or
+`GET /_fake/calls?error_code=190`, lists only the calls answered with that code, so a test can find
+the first refusal and check what the app sent after it.
 
 **Reset.** `resetMessaging()` forgets conversations, messages, people scoped to accounts, attachments
 and held webhooks. Accounts, tokens, media, comments, subscriptions and the logs stay.
@@ -423,6 +439,8 @@ relying on it.
 
 ## Changes
 
+- **0.6.0**: the calls ledger records the code, subcode and type of each Graph error the server
+  answered with, and `getCalls({ errorCode })` lists only the calls answered with one code.
 - **0.5.0**: a professional account's inbox: the Conversations API with paging, message details,
   reactions and replies; people scoped to accounts; seeded history; the Human Agent tag and sender
   actions; seen, edit, postback and referral webhooks, story replies and mentions, `ig_post` and
